@@ -1,83 +1,147 @@
-# src/model.py
 import torch
 import torch.nn as nn
-from src.tcn import TemporalConvNet
+import torch.nn.functional as F
+from typing import Tuple, Optional
+from .tcn import SimpleTCN
 
-class UnCLe(nn.Module):
-    """
-    The main UnCLe model for scalable dynamic causal discovery.
-    It consists of a shared Uncoupler-Recoupler TCN pair and auto-regressive Dependency Matrices.
-    """
-    def __init__(self, num_variables, num_channels, tcn_channels, kernel_size, dropout):
-        """
-        Args:
-            num_variables (int): Number of variables in the time series (N).
-            num_channels (int): Number of semantic channels for disentanglement (C).
-            tcn_channels (list of int): Number of filters in each TCN layer.
-            kernel_size (int): Kernel size for TCN convolutions.
-            dropout (float): Dropout rate.
-        """
-        super(UnCLe, self).__init__()
-        self.num_variables = num_variables
-        self.num_channels = num_channels
-
-        # Uncoupler: Maps each time series into multi-channel semantic representations
-        # Input: (Batch, 1, Time_Length) -> Output: (Batch, C, Time_Length')
-        self.uncoupler = TemporalConvNet(num_inputs=1, num_channels=tcn_channels + [num_channels], 
-                                         kernel_size=kernel_size, dropout=dropout)
-
-        # Recoupler: Reconstructs/predicts time series from semantic representations
-        # Input: (Batch, C, Time_Length') -> Output: (Batch, 1, Time_Length)
-        self.recoupler = TemporalConvNet(num_inputs=num_channels, num_channels=tcn_channels[::-1] + [1], 
-                                         kernel_size=kernel_size, dropout=dropout)
-
-        # Dependency Matrices (Psi): Models inter-variable dependencies in the latent space
-        # Shape: (C, N, N)
-        self.dependency_matrices = nn.Parameter(torch.randn(num_channels, num_variables, num_variables) * 0.1)
-        nn.init.xavier_uniform_(self.dependency_matrices)
-
-    def forward(self, x):
-        """
-        Forward pass for the UnCLe model during training.
+class UnCLENet(nn.Module):
+    def __init__(
+        self,
+        N: int,
+        latent_C: int = 16,
+        tcn_levels_unc: int = 4,
+        tcn_hidden_unc: int = 64,
+        kernel_size: int = 3,
+        dropout: float = 0.2,
+        activation: nn.Module = nn.Tanh() # 论文常用 Tanh 或 ReLU
+    ):
+        super().__init__()
+        self.N = N
+        self.C = latent_C
         
-        Args:
-            x (torch.Tensor): Input multivariate time series. Shape: (Batch=N, 1, T).
-                               Note: We treat each variable as a batch item for parameter sharing.
+        # --- Uncoupler ---
+        # 输入单变量 (C_in=1)，输出 Hidden
+        self.unc_tcn = SimpleTCN(in_channels=1, num_levels=tcn_levels_unc, 
+                                 hidden_channels=tcn_hidden_unc, kernel_size=kernel_size, dropout=dropout)
+        self.unc_proj = nn.Linear(tcn_hidden_unc, latent_C)
 
-        Returns:
-            tuple: A tuple containing:
-                - x_recon (torch.Tensor): Reconstructed time series. Shape: (N, 1, T).
-                - x_pred (torch.Tensor): Predicted time series. Shape: (N, 1, T-1).
-                - self.dependency_matrices (torch.Tensor): For L1 regularization.
+        # --- Recoupler ---
+        # 输入 Latent (C_in=latent_C)，输出 Hidden -> 1
+        self.rec_tcn = SimpleTCN(in_channels=latent_C, num_levels=tcn_levels_unc, 
+                                 hidden_channels=tcn_hidden_unc, kernel_size=kernel_size, dropout=dropout)
+        self.rec_proj = nn.Linear(tcn_hidden_unc, 1)
+
+        # --- Dependency Matrices (Psi) ---
+        # 优化点：初始化为较小的随机数，避免初始 Loss 过大，利于 L1 稀疏化
+        self.Psi = nn.Parameter(torch.randn(latent_C, N, N) * 0.02)
+        
+        self.latent_act = activation
+
+    def uncouple(self, x: torch.Tensor) -> torch.Tensor:
         """
-        # 1. Disentanglement (Uncoupler)
-        # x: (N, 1, T) -> z: (N, C, T')
-        # T' might be different from T if TCN changes sequence length, but our TCN preserves it.
-        z = self.uncoupler(x)
+        x: (B, N, T) -> z: (B, N, T, C)
+        """
+        B, N, T = x.shape
+        # Flatten N into Batch: (B*N, T, 1)
+        x_flat = x.view(B * N, T).unsqueeze(-1)
+        z_hidden = self.unc_tcn(x_flat)      # (B*N, T, hidden)
+        z = self.unc_proj(z_hidden)          # (B*N, T, C)
+        return z.view(B, N, T, self.C)
 
-        # 2. Reconstruction
-        # z: (N, C, T) -> x_recon: (N, 1, T)
-        x_recon = self.recoupler(z)
+    def recouple(self, z: torch.Tensor) -> torch.Tensor:
+        """
+        z: (B, N, T, C) -> x_recon: (B, N, T)
+        """
+        B, N, T, C = z.shape
+        # Flatten N into Batch: (B*N, T, C)
+        z_flat = z.view(B * N, T, C)
+        h = self.rec_tcn(z_flat)             # (B*N, T, hidden)
+        xhat = self.rec_proj(h).squeeze(-1)  # (B*N, T)
+        return xhat.view(B, N, T)
 
-        # 3. Auto-regressive Prediction in Latent Space
-        # z_t: (N, C, T-1) is used to predict z_{t+1}: (N, C, T-1)
-        z_current = z[:, :, :-1]  # Shape: (N, C, T-1)
-
-        # Reshape for matrix multiplication: (C, N, T-1)
-        z_current_permuted = z_current.permute(1, 0, 2)
-
-        # Apply dependency matrices: z_pred_permuted = Psi @ z_current_permuted
-        # (C, N, N) @ (C, N, T-1) -> (C, N, T-1) using einsum for batched matrix multiplication over C
-        z_pred_permuted = torch.einsum('cij,cjk->cik', self.dependency_matrices, z_current_permuted)
+    def predict_latent_next(self, z: torch.Tensor) -> torch.Tensor:
+        """
+        z: (B, N, T, C)
+        return zhat_next: (B, N, T, C) -> 对应 z_{t+1} 的预测
+        """
+        # Einstein Summation: (Batch, Time, Channel, Node) x (Channel, Node_out, Node_in)
+        # z: (B, N, T, C) -> permute -> (B, T, C, N)
+        z_perm = z.permute(0, 2, 3, 1) 
         
-        # Permute back to (N, C, T-1)
-        z_pred = z_pred_permuted.permute(1, 0, 2)
+        # Psi: (C, N, N) -> (C, To, From)
+        # z_perm: ..., From
+        # Output: ..., To
+        # equation: 'btcn,cnm->btcm' (n is source node, m is target node)
+        # 注意：Psi 的维度定义需统一。这里假设 Psi[c, i, j] 表示 j -> i 的权重 (i是行，j是列)
+        # 那么乘法应该是 Matrix @ Vector。
+        # z_perm[..., N] 是列向量。Psi @ z。
+        zhat = torch.einsum('btcn,cnm->btcm', z_perm, self.Psi)
         
-        # The paper mentions an activation function sigma, let's use ReLU as in TCN
-        z_pred = torch.relu(z_pred)
+        zhat = self.latent_act(zhat)
+        # 恢复维度 (B, T, C, N) -> (B, N, T, C)
+        return zhat.permute(0, 3, 1, 2).contiguous()
 
-        # 4. Map prediction back to original space (Recoupler)
-        # z_pred: (N, C, T-1) -> x_pred: (N, 1, T-1)
-        x_pred = self.recoupler(z_pred)
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        z = self.uncouple(x)              # (B, N, T, C)
+        x_recon = self.recouple(z)        # (B, N, T)
+        
+        zhat_next = self.predict_latent_next(z) # (B, N, T, C), zhat_next[:, t] is pred for t+1
+        
+        # 切片对齐：我们预测的是 x_{t+1}
+        # 使用 z_{0...T-2} 预测出的 latent 来重构 x_{1...T-1}
+        x_pred = self.recouple(zhat_next[..., :-1, :]) 
+        
+        return x_recon, x_pred, z
 
-        return x_recon, x_pred, self.dependency_matrices
+    def psi_l1(self):
+        return torch.sum(torch.abs(self.Psi))
+
+    @torch.no_grad()
+    def static_causal_aggregation(self) -> torch.Tensor:
+        # L2 Norm aggregation across channels
+        # Psi shape: (C, Target, Source) -> return (Target, Source)
+        return torch.sqrt(torch.mean(self.Psi ** 2, dim=0))
+
+    @torch.no_grad()
+    def dynamic_causal_strengths(self, x: torch.Tensor, perm_seed: Optional[int] = 42):
+        """
+        高效扰动推断
+        """
+        B, N, T = x.shape
+        _, x_pred_orig, z_orig = self.forward(x)
+        
+        # Baseline Error (aligned to t=1..T-1)
+        eps_orig = (x_pred_orig - x[..., 1:]) ** 2 
+        eps_orig_mean = eps_orig.mean(dim=0) # (N, T-1)
+
+        strengths = torch.zeros(N, N, T-1, device=x.device)
+
+        for j in range(N):
+            # 1. 扰动变量 j
+            if perm_seed is not None:
+                torch.manual_seed(perm_seed)
+            
+            x_j_pert = x[:, j, :].clone()
+            perm_idx = torch.randperm(T, device=x.device)
+            x_j_pert = x_j_pert[:, perm_idx]
+            
+            # 2. 仅重新计算 j 的 Latent
+            z_j_new = self.uncouple(x_j_pert.unsqueeze(1)).squeeze(1) # (B, T, C)
+            
+            # 3. 混合 Latent
+            z_mixed = z_orig.clone()
+            z_mixed[:, j, :, :] = z_j_new
+            
+            # 4. 预测与重构
+            zhat_mixed = self.predict_latent_next(z_mixed)
+            x_pred_mixed = self.recouple(zhat_mixed[..., :-1, :])
+            
+            # 5. 计算误差增益
+            eps_pert = (x_pred_mixed - x[..., 1:]) ** 2
+            eps_pert_mean = eps_pert.mean(dim=0)
+            
+            # j -> i 的强度
+            delta = F.relu(eps_pert_mean - eps_orig_mean)
+            strengths[j, :, :] = delta # (Source j, Target i, Time)
+
+        return strengths
