@@ -1,6 +1,7 @@
 import os
 import argparse
 import numpy as np
+from scipy.integrate import odeint
 from tqdm import tqdm
 import logging
 
@@ -19,46 +20,58 @@ def save_data(data, ground_truth, base_path, dataset_name, replica_id):
     np.save(gt_file, ground_truth)
     logging.info(f"Saved replica {replica_id} to {data_dir} | Data: {data.shape}, GT: {ground_truth.shape}")
 
-def generate_lorenz96(p, T, F, seed):
+def generate_lorenz96(p, T, F=10.0, seed=0, delta_t=0.1, burn_in=1000, noise_scale=0.1):
     """
-    Generates data from the Lorenz96 system.
-    GT Convention: [Cause, Effect] i.e., A[i, j] = 1 means i -> j
-    """
-    np.random.seed(seed)
+    Generates data from the Lorenz96 system using odeint.
     
-    # Ground truth: dx_i/dt depends on x_{i-1}, x_{i-2}, x_{i+1}
-    # So Parents(i) = {i-1, i-2, i+1}
-    # Matrix: Row=Cause, Col=Effect
-    gt = np.zeros((p, p))
+    Args:
+        p (int): Number of variables (dimension).
+        T (int): Number of time steps to record.
+        F (float): Forcing constant.
+        seed (int): Random seed.
+        delta_t (float): Sampling interval.
+        burn_in (int): Number of steps to discard to reach chaotic attractor.
+        noise_scale (float): Standard deviation of Gaussian noise added to observations.
+
+    Returns:
+        data (np.ndarray): Shape (T, p). The time series.
+        gt (np.ndarray): Shape (p, p). Ground Truth adjacency matrix. 
+                         Row=Cause, Col=Effect.
+    """
+    if seed is not None:
+        np.random.seed(seed)
+
+    # 1. Define the ODE system (Vectorized)
+    def lorenz96_deriv(x, t):
+        # dx/dt = (x[i+1] - x[i-2]) * x[i-1] - x[i] + F
+        x_plus_1 = np.roll(x, -1)
+        x_minus_1 = np.roll(x, 1)
+        x_minus_2 = np.roll(x, 2)
+        dxdt = (x_plus_1 - x_minus_2) * x_minus_1 - x + F
+        return dxdt
+
+    # 2. Integration using scipy.odeint
+    x0 = np.random.normal(scale=0.01, size=p) + F 
+    
+    total_steps = T + burn_in
+    t = np.linspace(0, total_steps * delta_t, total_steps)
+    X_full = odeint(lorenz96_deriv, x0, t)
+    X = X_full[burn_in:, :]
+    
+    if noise_scale > 0:
+        X += np.random.normal(scale=noise_scale, size=X.shape)
+
+    # 4. Construct Ground Truth (GT)
+    # Convention: Matrix[i, j] = 1 means i -> j (Row causes Column)
+    # Equation for x_i depends on: x_{i+1}, x_{i-2}, x_{i-1}, x_i
+    gt = np.zeros((p, p), dtype=int)
     for i in range(p):
         gt[(i - 1) % p, i] = 1  # i-1 -> i
         gt[(i - 2) % p, i] = 1  # i-2 -> i
         gt[(i + 1) % p, i] = 1  # i+1 -> i
+        gt[i, i] = 1            # i -> i (Self-loop)
         
-    # ODE integration using Euler method
-    dt = 0.01
-    burn_in_steps = 1000
-    total_steps = T * 10 + burn_in_steps # Sample every 10 steps
-    
-    x = np.random.normal(0, 1, p)
-    
-    data_full = []
-    for _ in range(total_steps):
-        dxdt = np.zeros(p)
-        # Vectorized computation for speed
-        # dx/dt = (x[i+1] - x[i-2]) * x[i-1] - x[i] + F
-        x_plus_1 = np.roll(x, -1)
-        x_minus_2 = np.roll(x, 2)
-        x_minus_1 = np.roll(x, 1)
-        dxdt = (x_plus_1 - x_minus_2) * x_minus_1 - x + F
-        
-        x = x + dxdt * dt
-        data_full.append(x.copy())
-        
-    data_full = np.array(data_full)
-    data = data_full[burn_in_steps::10, :] # Subsample
-    
-    return data, gt
+    return X, gt
 
 def generate_tvsem(T, seed):
     """
@@ -199,11 +212,11 @@ def main():
 
         if args.dataset == 'lorenz96':
             # Lorenz#1 config
-            data, gt = generate_lorenz96(p=20, T=250, F=10, seed=seed)
+            data, gt = generate_lorenz96(p=128, T=1000, F=10, seed=seed)
         elif args.dataset == 'tvsem':
-            data, gt = generate_tvsem(T=2000, seed=seed)
+            data, gt = generate_tvsem(T=1000, seed=seed)
         elif args.dataset == 'nc8':
-            data, gt = generate_nc8(T=2000, seed=seed)
+            data, gt = generate_nc8(T=1000, seed=seed)
         else:
             raise ValueError("Unknown dataset.")
             

@@ -7,7 +7,7 @@ class BaseConfig:
         self.seq_len = 200        # 序列长度 (T) (仅参考，实际由数据决定)
         
         # --- 模型结构 ---
-        self.latent_dim = 16      # 潜在空间维度 (C)
+        self.latent_dim = 32      # 潜在空间维度 (C)
         self.tcn_levels = 4       # TCN 层数
         self.tcn_hidden = 64      # TCN 隐藏层通道数
         self.kernel_size = 3      # 卷积核大小
@@ -39,10 +39,10 @@ class BaseConfig:
 class Lorenz96Config(BaseConfig):
     def __init__(self):
         super().__init__()
-        self.n_vars = 20
-        self.recon_epochs = 200   # 示例：可以调小一点做快速实验
-        self.joint_epochs = 500
-        self.batch_size = 16
+        self.n_vars = 128
+        self.recon_epochs = 50
+        self.joint_epochs = 100
+        self.batch_size = 256
 
 class NC8Config(BaseConfig):
     def __init__(self):
