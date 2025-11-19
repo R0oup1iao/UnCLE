@@ -1,20 +1,21 @@
 import numpy as np
 from sklearn.metrics import auc, precision_recall_curve, roc_curve, accuracy_score, f1_score, recall_score
 
-def count_accuracy(B_true, B_prob):
+def count_accuracy(B_true, B_prob, ignore_diag=True):
     """
     计算因果发现的常用指标。
     B_true: 真实邻接矩阵 (N, N) (binary)
     B_prob: 预测的权重矩阵 (N, N) (continuous)
     注意：默认忽略对角线元素。
     """
-    # 展平并移除对角线
     n = B_true.shape[0]
-    # 获取非对角线的 mask
-    mask = ~np.eye(n, dtype=bool)
-    
-    true_flat = B_true[mask].flatten()
-    prob_flat = B_prob[mask].flatten()
+    if ignore_diag:
+        mask = ~np.eye(n, dtype=bool)
+        true_flat = B_true[mask].flatten()
+        prob_flat = B_prob[mask].flatten()
+    else:
+        true_flat = B_true.flatten()
+        prob_flat = B_prob.flatten()
     
     # 1. AUROC
     if len(np.unique(true_flat)) < 2:

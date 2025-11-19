@@ -21,8 +21,6 @@ def main():
     # 必需参数
     parser.add_argument('--model_path', type=str, required=True, help="Path to trained model.pth")
     parser.add_argument('--data_path', type=str, required=True, help="Path to data folder")
-    
-    # [New] 配置相关参数
     parser.add_argument('--config_name', type=str, default='lorenz96', 
                         choices=['lorenz96', 'nc8', 'tvsem', 'default'], 
                         help="Config preset name used for training (Must match training!)")
