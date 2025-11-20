@@ -8,7 +8,7 @@ import json
 # Add project root to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from src.data_loader import get_dataloader
+from src.dataloader import get_dataloader
 from src.model import UnCLENet
 from src.utils import set_seed
 from src.metrics import count_accuracy

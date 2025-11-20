@@ -1,147 +1,150 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from typing import Tuple, Optional
-from .tcn import SimpleTCN
+import math
+import numpy as np
+from sklearn.cluster import KMeans
 
-class UnCLENet(nn.Module):
-    def __init__(
-        self,
-        N: int,
-        latent_C: int = 16,
-        tcn_levels_unc: int = 4,
-        tcn_hidden_unc: int = 64,
-        kernel_size: int = 3,
-        dropout: float = 0.2,
-        activation: nn.Module = nn.Tanh() # 论文常用 Tanh 或 ReLU
-    ):
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe.unsqueeze(0))
+
+    def forward(self, x):
+        return x + self.pe[:, :x.size(1), :]
+
+class CausalTransformerBlock(nn.Module):
+    def __init__(self, input_dim, output_dim, d_model=64, nhead=4, num_layers=2, dropout=0.1):
+        super().__init__()
+        self.input_proj = nn.Linear(input_dim, d_model)
+        self.pos_encoder = PositionalEncoding(d_model)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, 
+                                                   dim_feedforward=d_model*2, 
+                                                   dropout=dropout, batch_first=True, norm_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.output_proj = nn.Linear(d_model, output_dim)
+
+    def _generate_square_subsequent_mask(self, sz):
+        mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
+        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+        return mask
+
+    def forward(self, x):
+        B, T, C = x.shape
+        x = self.input_proj(x)
+        x = self.pos_encoder(x)
+        mask = self._generate_square_subsequent_mask(T).to(x.device)
+        out = self.transformer(x, mask=mask, is_causal=True)
+        return self.output_proj(out)
+
+class CausalFormer(nn.Module):
+    def __init__(self, N, latent_C=8, d_model=64, nhead=4, num_layers=2):
         super().__init__()
         self.N = N
         self.C = latent_C
-        
-        # --- Uncoupler ---
-        # 输入单变量 (C_in=1)，输出 Hidden
-        self.unc_tcn = SimpleTCN(in_channels=1, num_levels=tcn_levels_unc, 
-                                 hidden_channels=tcn_hidden_unc, kernel_size=kernel_size, dropout=dropout)
-        self.unc_proj = nn.Linear(tcn_hidden_unc, latent_C)
-
-        # --- Recoupler ---
-        # 输入 Latent (C_in=latent_C)，输出 Hidden -> 1
-        self.rec_tcn = SimpleTCN(in_channels=latent_C, num_levels=tcn_levels_unc, 
-                                 hidden_channels=tcn_hidden_unc, kernel_size=kernel_size, dropout=dropout)
-        self.rec_proj = nn.Linear(tcn_hidden_unc, 1)
-
-        # --- Dependency Matrices (Psi) ---
-        # 优化点：初始化为较小的随机数，避免初始 Loss 过大，利于 L1 稀疏化
+        self.unc_trans = CausalTransformerBlock(input_dim=1, output_dim=latent_C, 
+                                                d_model=d_model, nhead=nhead, num_layers=num_layers)
+        self.rec_trans = CausalTransformerBlock(input_dim=latent_C, output_dim=1, 
+                                                d_model=d_model, nhead=nhead, num_layers=num_layers)
         self.Psi = nn.Parameter(torch.randn(latent_C, N, N) * 0.02)
-        
-        self.latent_act = activation
+        self.latent_act = nn.Tanh()
 
-    def uncouple(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: (B, N, T) -> z: (B, N, T, C)
-        """
+    def uncouple(self, x):
         B, N, T = x.shape
-        # Flatten N into Batch: (B*N, T, 1)
-        x_flat = x.view(B * N, T).unsqueeze(-1)
-        z_hidden = self.unc_tcn(x_flat)      # (B*N, T, hidden)
-        z = self.unc_proj(z_hidden)          # (B*N, T, C)
+        z = self.unc_trans(x.view(B*N, T, 1))
         return z.view(B, N, T, self.C)
 
-    def recouple(self, z: torch.Tensor) -> torch.Tensor:
-        """
-        z: (B, N, T, C) -> x_recon: (B, N, T)
-        """
+    def recouple(self, z):
         B, N, T, C = z.shape
-        # Flatten N into Batch: (B*N, T, C)
-        z_flat = z.view(B * N, T, C)
-        h = self.rec_tcn(z_flat)             # (B*N, T, hidden)
-        xhat = self.rec_proj(h).squeeze(-1)  # (B*N, T)
+        xhat = self.rec_trans(z.view(B*N, T, C))
         return xhat.view(B, N, T)
 
-    def predict_latent_next(self, z: torch.Tensor) -> torch.Tensor:
-        """
-        z: (B, N, T, C)
-        return zhat_next: (B, N, T, C) -> 对应 z_{t+1} 的预测
-        """
-        # Einstein Summation: (Batch, Time, Channel, Node) x (Channel, Node_out, Node_in)
-        # z: (B, N, T, C) -> permute -> (B, T, C, N)
+    def predict_latent_next(self, z):
         z_perm = z.permute(0, 2, 3, 1) 
-        
-        # Psi: (C, N, N) -> (C, To, From)
-        # z_perm: ..., From
-        # Output: ..., To
-        # equation: 'btcn,cnm->btcm' (n is source node, m is target node)
-        # 注意：Psi 的维度定义需统一。这里假设 Psi[c, i, j] 表示 j -> i 的权重 (i是行，j是列)
-        # 那么乘法应该是 Matrix @ Vector。
-        # z_perm[..., N] 是列向量。Psi @ z。
         zhat = torch.einsum('btcn,cnm->btcm', z_perm, self.Psi)
-        
-        zhat = self.latent_act(zhat)
-        # 恢复维度 (B, T, C, N) -> (B, N, T, C)
-        return zhat.permute(0, 3, 1, 2).contiguous()
+        return self.latent_act(zhat).permute(0, 3, 1, 2).contiguous()
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        z = self.uncouple(x)              # (B, N, T, C)
-        x_recon = self.recouple(z)        # (B, N, T)
-        
-        zhat_next = self.predict_latent_next(z) # (B, N, T, C), zhat_next[:, t] is pred for t+1
-        
-        # 切片对齐：我们预测的是 x_{t+1}
-        # 使用 z_{0...T-2} 预测出的 latent 来重构 x_{1...T-1}
-        x_pred = self.recouple(zhat_next[..., :-1, :]) 
-        
+    def forward(self, x):
+        z = self.uncouple(x)
+        x_recon = self.recouple(z)
+        zhat_next = self.predict_latent_next(z)
+        x_pred = self.recouple(zhat_next[..., :-1, :])
         return x_recon, x_pred, z
 
     def psi_l1(self):
         return torch.sum(torch.abs(self.Psi))
 
-    @torch.no_grad()
-    def static_causal_aggregation(self) -> torch.Tensor:
-        # L2 Norm aggregation across channels
-        # Psi shape: (C, Target, Source) -> return (Target, Source)
+    def static_causal_aggregation(self):
         return torch.sqrt(torch.mean(self.Psi ** 2, dim=0))
 
-    @torch.no_grad()
-    def dynamic_causal_strengths(self, x: torch.Tensor, perm_seed: Optional[int] = 42):
-        """
-        高效扰动推断
-        """
-        B, N, T = x.shape
-        _, x_pred_orig, z_orig = self.forward(x)
+class ST_CausalFormer(nn.Module):
+    def __init__(self, N, coords, k_patches=4, latent_C=8, d_model=64):
+        super().__init__()
+        self.k_patches = k_patches
+        self.N = coords.shape[0]
+        # KMeans 最好固定 random_state 以保证多卡一致性
+        kmeans = KMeans(n_clusters=k_patches, random_state=42, n_init=10)
+        self.patch_labels = kmeans.fit_predict(coords)
         
-        # Baseline Error (aligned to t=1..T-1)
-        eps_orig = (x_pred_orig - x[..., 1:]) ** 2 
-        eps_orig_mean = eps_orig.mean(dim=0) # (N, T-1)
+        self.coarse_model = CausalFormer(N=k_patches, latent_C=latent_C, d_model=d_model)
+        self.fine_model = CausalFormer(N=N, latent_C=latent_C, d_model=d_model)
+        self.register_buffer('psi_mask', torch.ones(latent_C, N, N))
+        
+    def forward(self, x, mode='fine'):
+        if mode == 'coarse':
+            # 1. 聚合
+            x_patch = self.aggregate_to_patches(x)
+            # 2. 运行 coarse model
+            # 返回 output 和 target(x_patch) 方便计算 loss
+            return self.coarse_model(x_patch), x_patch
+            
+        elif mode == 'fine':
+            # Fine 阶段逻辑
+            # 1. 应用 mask (注意：mask 更新最好放在 forward 里或 forward 前，这里保持原有逻辑)
+            self.fine_model.Psi.data.mul_(self.psi_mask.to(x.device))
+            # 2. 运行 fine model
+            return self.fine_model(x)
+        
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
 
-        strengths = torch.zeros(N, N, T-1, device=x.device)
+    def aggregate_to_patches(self, x):
+        B, N, T = x.shape
+        patch_x = torch.zeros(B, self.k_patches, T, device=x.device)
+        for k in range(self.k_patches):
+            idx = np.where(self.patch_labels == k)[0]
+            if len(idx) > 0:
+                patch_x[:, k, :] = x[:, idx, :].mean(dim=1)
+        return patch_x
 
-        for j in range(N):
-            # 1. 扰动变量 j
-            if perm_seed is not None:
-                torch.manual_seed(perm_seed)
+    def update_mask(self, threshold=None):
+        patch_graph = self.coarse_model.static_causal_aggregation().cpu()
+        
+        if threshold is None:
+            mask_diag = ~torch.eye(self.k_patches, dtype=torch.bool)
+            off_diag_values = patch_graph[mask_diag]
+            threshold = off_diag_values.mean() + 0.5 * off_diag_values.std()
             
-            x_j_pert = x[:, j, :].clone()
-            perm_idx = torch.randperm(T, device=x.device)
-            x_j_pert = x_j_pert[:, perm_idx]
-            
-            # 2. 仅重新计算 j 的 Latent
-            z_j_new = self.uncouple(x_j_pert.unsqueeze(1)).squeeze(1) # (B, T, C)
-            
-            # 3. 混合 Latent
-            z_mixed = z_orig.clone()
-            z_mixed[:, j, :, :] = z_j_new
-            
-            # 4. 预测与重构
-            zhat_mixed = self.predict_latent_next(z_mixed)
-            x_pred_mixed = self.recouple(zhat_mixed[..., :-1, :])
-            
-            # 5. 计算误差增益
-            eps_pert = (x_pred_mixed - x[..., 1:]) ** 2
-            eps_pert_mean = eps_pert.mean(dim=0)
-            
-            # j -> i 的强度
-            delta = F.relu(eps_pert_mean - eps_orig_mean)
-            strengths[j, :, :] = delta # (Source j, Target i, Time)
+        mask = torch.zeros((self.N, self.N))
+        patch_binary = (patch_graph > threshold).float()
+        
+        for p_tgt in range(self.k_patches):
+            for p_src in range(self.k_patches):
+                if patch_binary[p_tgt, p_src] > 0 or p_tgt == p_src:
+                    src_idx = np.where(self.patch_labels == p_src)[0]
+                    tgt_idx = np.where(self.patch_labels == p_tgt)[0]
+                    for t in tgt_idx:
+                        mask[t, src_idx] = 1.0
+                        
+        target_device = self.fine_model.Psi.device 
+        self.psi_mask = mask.unsqueeze(0).repeat(self.fine_model.C, 1, 1).to(target_device)
+        return patch_graph, threshold, self.psi_mask.mean().item()
 
-        return strengths
+    def forward_fine(self, x):
+        # 应用 mask
+        self.fine_model.Psi.data.mul_(self.psi_mask.to(x.device))
+        return self.fine_model(x)

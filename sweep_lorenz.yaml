@@ -1,0 +1,48 @@
+program: src/run.py
+method: grid  # 使用 grid 模式，把下面的组合全跑一遍
+metric:
+  name: fine/mse_pre
+  goal: minimize
+
+parameters:
+  # --- Data ---
+  dataset:
+    value: lorenz96
+  data_path:
+    value: data/synthetic
+  replica_id:
+    value: 0  # 跑两个副本看看稳不稳定
+  
+  # --- Model Structure ---
+  N:
+    value: 128     # 必须对应你生成的数据
+  k_patches:
+    values: [8, 16] # 这是一个很有趣的超参，试试切8块好还是16块好
+  latent_C:
+    values: [16, 32]
+  
+  # --- Training Strategy ---
+  batch_size:
+    value: 64
+  window_size:
+    value: 10
+  stride:
+    value: 1      # 步长20，数据量适中
+  epochs_coarse:
+    value: 100
+  epochs_fine:
+    value: 200
+    
+  # --- Misc ---
+  project_name:
+    value: "Lorenz96_Benchmark-v2"
+
+# 这一段是告诉 WandB 如何启动双卡训练
+command:
+  - ${env}
+  - accelerate
+  - launch
+  - --config_file
+  - accelerate_config.yaml  # 记得确保这个文件在根目录
+  - ${program}
+  - ${args}
