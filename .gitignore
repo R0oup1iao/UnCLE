@@ -107,7 +107,7 @@ input/
 saved/
 datasets/
 data/
-results/checkpoints
+results/
 
 # editor, os cache directory
 .vscode/
