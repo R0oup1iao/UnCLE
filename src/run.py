@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 import wandb
 import numpy as np
-import json  # [New] for printing metrics
+import json 
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import set_seed
 from tqdm.auto import tqdm
@@ -17,6 +17,21 @@ from model import ST_CausalFormer
 from dataloader import get_data_context
 from visualize import create_dynamic_gif
 from metrics import count_accuracy
+
+# ==========================================
+# Helper Functions
+# ==========================================
+def compute_entropy_loss(S):
+    """
+    S: (B, N, K) 分配矩阵
+    目标: 最小化熵，鼓励 S 接近 One-hot
+    """
+    entropy = -torch.sum(S * torch.log(S + 1e-6), dim=-1)
+    return entropy.mean()
+
+def pretty_dict(d):
+    """Convert numpy/tensor keys/values to python int for clean printing"""
+    return {int(k): int(v) for k, v in d.items()}
 
 # ==========================================
 # Dynamic Causal Discovery Logic
@@ -61,51 +76,57 @@ def save_plots(model, meta, est_patch_graph, output_dir):
     N = meta['coords'].shape[0]
     coords = meta['coords']
     
+    # Patch Labels 来自第一层聚类 (Fine -> Level 1)
     if hasattr(model, 'patch_labels'):
         patch_ids = model.patch_labels 
     else:
         patch_ids = np.zeros(N)
 
     est_fine = model.fine_model.static_causal_aggregation().detach().cpu().numpy().T
+    
+    # est_patch_graph 现在是 Top Level Graph
     est_coarse = est_patch_graph.detach().cpu().numpy().T
+    
     mask_vis = model.psi_mask.mean(0).cpu().numpy().T
     
-    # [Fix] Handle missing GT for real data
     gt_fine = meta.get('gt_fine')
-    if gt_fine is None:
-        gt_fine = np.zeros_like(est_fine) # Placeholder
+    if gt_fine is None: gt_fine = np.zeros_like(est_fine)
         
     gt_coarse = meta.get('gt_coarse')
-    if gt_coarse is None:
-        gt_coarse = np.zeros_like(est_coarse)
+    if gt_coarse is None: gt_coarse = np.zeros_like(est_coarse)
 
     plt.switch_backend('Agg') 
     fig = plt.figure(figsize=(15, 10))
     
-    # Plots 1-6 (Same as before)
+    # 1. Spatial Layout (Level 1 Clusters)
     ax1 = fig.add_subplot(2, 3, 1)
     ax1.scatter(coords[:, 0], coords[:, 1], c=patch_ids, cmap='tab10', s=50)
-    ax1.set_title(f"Spatial Layout ({N} Nodes)")
+    ax1.set_title(f"Spatial Clusters (L1)")
 
+    # 2. GT Coarse
     ax2 = fig.add_subplot(2, 3, 2)
     ax2.imshow(gt_coarse, cmap='Blues', vmin=0)
     ax2.set_title("GT Coarse (Ref)")
 
+    # 3. Est Coarse (Top Level)
     ax3 = fig.add_subplot(2, 3, 3)
     ax3.imshow(est_coarse, cmap='Reds', vmin=0)
-    ax3.set_title("Est Coarse")
+    ax3.set_title("Est Coarse (Top Level)")
 
+    # 4. GT Fine
     ax4 = fig.add_subplot(2, 3, 4)
     ax4.imshow(gt_fine, cmap='Blues', vmin=0)
-    ax4.set_title("GT Fine" if meta.get('gt_fine') is not None else "GT Fine (N/A)")
+    ax4.set_title("GT Fine")
 
+    # 5. Est Fine
     ax5 = fig.add_subplot(2, 3, 5)
     ax5.imshow(est_fine, cmap='Reds', vmin=0)
     ax5.set_title("Est Fine")
 
+    # 6. Mask
     ax6 = fig.add_subplot(2, 3, 6)
     ax6.imshow(mask_vis, cmap='Greens', vmin=0)
-    ax6.set_title("Adaptive Spatial Mask")
+    ax6.set_title("DiffPool Generated Mask")
 
     plt.tight_layout()
     save_path = os.path.join(output_dir, "result_full.png")
@@ -114,42 +135,98 @@ def save_plots(model, meta, est_patch_graph, output_dir):
     return save_path
 
 # ==========================================
-# Training Phases (Coarse & Fine) - Unchanged
+# Training Phases
 # ==========================================
-def train_phase_coarse(model, loader, optimizer, accelerator, epochs):
+def train_phase_hierarchy(model, loader, optimizer, accelerator, epochs):
     model.train() 
-    progress_bar = tqdm(range(epochs), disable=not accelerator.is_local_main_process, desc="Phase 1: Coarse")
+    progress_bar = tqdm(range(epochs), disable=not accelerator.is_local_main_process, desc="Phase 1: Hierarchy")
+    
     for ep in progress_bar:
         epoch_loss = 0.0
+        epoch_ent = 0.0
+        tau = max(0.1, np.exp(-ep * 0.03)) 
+
         for batch in loader:
             if isinstance(batch, (list, tuple)): x = batch[0]
             else: x = batch
+            
             optimizer.zero_grad()
-            (x_rec, x_pre, _), x_patch = model(x, mode='coarse')
-            loss = F.mse_loss(x_rec, x_patch) + F.mse_loss(x_pre, x_patch[..., 1:]) + 2e-3 * accelerator.unwrap_model(model).coarse_model.psi_l1()
+            
+            # Forward returns a list of results for each level
+            results = model(x, mode='hierarchy', tau=tau)
+            
+            total_loss = 0.0
+            total_ent_loss = 0.0
+            
+            # Sum loss across all levels
+            for res in results:
+                (x_rec, x_pre, _), x_patch, S = res['out'], res['target'], res['S']
+                
+                loss_rec = F.mse_loss(x_rec, x_patch)
+                loss_pre = F.mse_loss(x_pre, x_patch[..., 1:])
+                loss_ent = 1e-2 * compute_entropy_loss(S)
+                
+                total_loss += loss_rec + loss_pre + loss_ent
+                total_ent_loss += loss_ent
+            
+            # L1 Reg for all coarse models
+            unwrapped = accelerator.unwrap_model(model)
+            l1_loss = 0.0
+            for cm in unwrapped.coarse_models:
+                l1_loss += 2e-3 * cm.psi_l1()
+            
+            loss = total_loss + l1_loss
+            
             accelerator.backward(loss)
             optimizer.step()
             epoch_loss += loss.item()
-        accelerator.log({"coarse/loss": epoch_loss / len(loader)})
+            epoch_ent += total_ent_loss.item()
+        
+        accelerator.log({
+            "hierarchy/total_loss": epoch_loss / len(loader),
+            "hierarchy/ent": epoch_ent / len(loader),
+            "tau": tau
+        })
         progress_bar.set_postfix(loss=epoch_loss / len(loader))
+
+    # [Debug] Pretty Print Distribution
+    if accelerator.is_main_process:
+        unwrapped = accelerator.unwrap_model(model)
+        print(f"\n🔍 [Debug] Hierarchy Cluster Analysis:")
+        for i, S in enumerate(unwrapped.S_list):
+            if S is not None:
+                S_hard = S.mean(0).argmax(dim=1).cpu().numpy()
+                unique, counts = np.unique(S_hard, return_counts=True)
+                dist = dict(zip(unique, counts))
+                print(f"   Level {i} (Dim {unwrapped.hierarchy[i]}) Dist: {pretty_dict(dist)}")
 
 def train_phase_fine(model, loader, optimizer, accelerator, epochs):
     model.train()
-    progress_bar = tqdm(range(epochs), disable=not accelerator.is_local_main_process, desc="Phase 2: Fine")
+    progress_bar = tqdm(range(epochs), disable=not accelerator.is_local_main_process, desc="Phase 2: Fine (Masked)")
+    
     for ep in progress_bar:
         epoch_loss = 0.0
         for batch in loader:
             if isinstance(batch, (list, tuple)): x = batch[0]
             else: x = batch
+            
             optimizer.zero_grad()
             x_rec, x_pre, _ = model(x, mode='fine')
+            
             unwrapped = accelerator.unwrap_model(model)
-            loss = F.mse_loss(x_rec, x) + F.mse_loss(x_pre, x[..., 1:]) + 1e-3 * unwrapped.fine_model.psi_l1()
+            loss_rec = F.mse_loss(x_rec, x)
+            loss_pre = F.mse_loss(x_pre, x[..., 1:])
+            loss_l1 = 1e-3 * unwrapped.fine_model.psi_l1()
+            
+            loss = loss_rec + loss_pre + loss_l1
             accelerator.backward(loss)
+            
             if unwrapped.fine_model.Psi.grad is not None:
                 unwrapped.fine_model.Psi.grad.mul_(unwrapped.psi_mask.to(x.device))
+                
             optimizer.step()
             epoch_loss += loss.item()
+            
         accelerator.log({"fine/loss": epoch_loss / len(loader)})
         progress_bar.set_postfix(loss=epoch_loss / len(loader))
 
@@ -165,54 +242,69 @@ def main(args):
         if not os.path.exists(args.output_dir): os.makedirs(args.output_dir)
         accelerator.init_trackers(project_name=args.project_name, config=vars(args), 
                                   init_kwargs={"wandb": {"entity": args.wandb_entity}})
-        accelerator.print(f"🚀 Experiment: {args.dataset}, N={args.N}")
+        accelerator.print(f"🚀 Experiment: {args.dataset}, N={args.N}, Hierarchy={args.hierarchy}")
 
-    # Data
     train_loader, val_loader, meta = get_data_context(args)
 
-    # Model
-    model = ST_CausalFormer(N=args.N, coords=meta['coords'], k_patches=args.k_patches, 
-                            latent_C=args.latent_C, d_model=args.d_model)
-    opt_coarse = torch.optim.Adam(model.coarse_model.parameters(), lr=args.lr_coarse)
-    opt_fine = torch.optim.Adam(model.fine_model.parameters(), lr=args.lr_fine)
-    model, opt_coarse, opt_fine, train_loader, val_loader = accelerator.prepare(model, opt_coarse, opt_fine, train_loader, val_loader)
+    # Init Model with Argument Hierarchy
+    model = ST_CausalFormer(
+        N=args.N, 
+        coords=meta['coords'], 
+        hierarchy=args.hierarchy,   # Use Args
+        latent_C=args.latent_C, 
+        d_model=args.d_model,
+        seq_len=args.window_size
+    )
 
-    # Training
-    train_phase_coarse(model, train_loader, opt_coarse, accelerator, args.epochs_coarse)
+    # Optimizer
+    params_hierarchy = []
+    for cm in model.coarse_models: params_hierarchy.extend(list(cm.parameters()))
+    for p in model.poolers: params_hierarchy.extend(list(p.parameters()))
+    
+    opt_hierarchy = torch.optim.Adam(params_hierarchy, lr=args.lr_coarse)
+    opt_fine = torch.optim.Adam(model.fine_model.parameters(), lr=args.lr_fine)
+
+    model, opt_hierarchy, opt_fine, train_loader, val_loader = accelerator.prepare(
+        model, opt_hierarchy, opt_fine, train_loader, val_loader
+    )
+
+    # 1. Train Hierarchy
+    train_phase_hierarchy(model, train_loader, opt_hierarchy, accelerator, args.epochs_coarse)
+    
+    # 2. Update Mask (Cascaded)
     accelerator.wait_for_everyone()
     unwrapped_model = accelerator.unwrap_model(model)
+    
+    # [Fix] patch_graph is assigned here
     patch_graph, thresh, ratio = unwrapped_model.update_mask()
-    if accelerator.is_main_process: accelerator.print(f"✅ Mask Updated. Ratio: {ratio:.2%}")
+    
+    if accelerator.is_main_process: 
+        accelerator.print(f"✅ Cascaded Mask Generated. Ratio: {ratio:.2%}")
+
+    # 3. Train Fine
     train_phase_fine(model, train_loader, opt_fine, accelerator, args.epochs_fine)
 
-    # Evaluation
+    # 4. Evaluation
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         accelerator.print("\n📊 Evaluation & Visualization...")
         
-        # 1. Static Graph Metrics
-        # 获取估计的静态图
-        est_static = unwrapped_model.fine_model.static_causal_aggregation().cpu().detach().numpy() # (Source, Target) from Psi
-        
+        est_static = unwrapped_model.fine_model.static_causal_aggregation().detach().cpu().numpy()
         gt_fine = meta.get('gt_fine')
+        
         if gt_fine is not None:
-            # 计算指标
-            # 假设 GT 也是 (Source, Target)
             metrics = count_accuracy(gt_fine, est_static)
             accelerator.print("\n🏆 Causal Discovery Metrics:")
             accelerator.print(json.dumps(metrics, indent=4))
-            
-            # Log to WandB
             wandb.log(metrics)
         else:
-            accelerator.print("⚠️ Ground Truth not available. Skipping metrics calculation.")
+            accelerator.print("⚠️ Ground Truth not available. Skipping metrics.")
 
-        # 2. Save Plots
+        # [Fix] Now patch_graph variable exists and is passed correctly
         path_static = save_plots(unwrapped_model, meta, patch_graph, args.output_dir)
         try: wandb.log({"static_result": wandb.Image(path_static)})
         except: pass
         
-        # 3. Dynamic Inference
         accelerator.print("🎬 Computing Dynamic Causal Graph...")
         torch.cuda.empty_cache() 
         try:
@@ -245,7 +337,11 @@ if __name__ == "__main__":
     parser.add_argument("--data_path", type=str, default="data/synthetic")
     parser.add_argument("--replica_id", type=int, default=0)
     parser.add_argument("--N", type=int, default=128)
-    parser.add_argument("--k_patches", type=int, default=8)
+    
+    # [New] Hierarchy Argument (list of ints)
+    parser.add_argument("--hierarchy", type=int, nargs='+', default=[32, 8], 
+                        help="Hierarchy levels, e.g. --hierarchy 32 8")
+    
     parser.add_argument("--latent_C", type=int, default=8)
     parser.add_argument("--d_model", type=int, default=64)
     parser.add_argument("--batch_size", type=int, default=64)
@@ -259,5 +355,9 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", type=str, default="./results")
     parser.add_argument("--project_name", type=str, default="ST-CausalFormer-Exp")
     parser.add_argument("--wandb_entity", type=str, default=None)
+    
+    # Deprecated arg (kept for compatibility but not used)
+    parser.add_argument("--k_patches", type=int, default=8, help="Deprecated, use --hierarchy")
+
     args = parser.parse_args()
     main(args)

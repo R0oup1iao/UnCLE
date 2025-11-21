@@ -1,9 +1,12 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 import numpy as np
-from sklearn.cluster import KMeans
 
+# ==========================================
+# Basic Components (Transformer, PE)
+# ==========================================
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=5000):
         super().__init__()
@@ -81,70 +84,198 @@ class CausalFormer(nn.Module):
     def static_causal_aggregation(self):
         return torch.sqrt(torch.mean(self.Psi ** 2, dim=0))
 
-class ST_CausalFormer(nn.Module):
-    def __init__(self, N, coords, k_patches=4, latent_C=8, d_model=64):
+# ==========================================
+# DiffPool Components
+# ==========================================
+class LearnableSpatialPooler(nn.Module):
+    def __init__(self, input_seq_len, k_patches):
         super().__init__()
-        self.k_patches = k_patches
-        self.N = coords.shape[0]
-        # KMeans 最好固定 random_state 以保证多卡一致性
-        kmeans = KMeans(n_clusters=k_patches, random_state=42, n_init=10)
-        self.patch_labels = kmeans.fit_predict(coords)
+        # 输入特征: 时间序列长度 (T) + 空间坐标 (2)
+        self.input_dim = input_seq_len + 2
         
-        self.coarse_model = CausalFormer(N=k_patches, latent_C=latent_C, d_model=d_model)
+        self.net = nn.Sequential(
+            nn.Linear(self.input_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, k_patches)
+        )
+        
+    def forward(self, x, coords, temperature=1.0):
+        """
+        x: (B, N, T) 原始时间序列
+        coords: (N, 2) 空间坐标
+        """
+        B, N, T = x.shape
+        
+        # 1. 准备输入特征
+        # 扩展 coords 到 Batch: (B, N, 2)
+        coords_batch = coords.unsqueeze(0).repeat(B, 1, 1).to(x.device)
+        
+        # 拼接: (B, N, T+2)
+        feat = torch.cat([x, coords_batch], dim=-1) 
+        
+        # 2. 预测 Logits
+        logits = self.net(feat) # (B, N, K)
+        
+        # 3. Gumbel Softmax
+        if self.training:
+            S = F.gumbel_softmax(logits, tau=temperature, hard=False, dim=-1)
+        else:
+            S = F.softmax(logits / temperature, dim=-1)
+            
+        return S, logits
+
+class ST_CausalFormer(nn.Module):
+    def __init__(self, N, coords, hierarchy=[32, 8], latent_C=8, d_model=64, seq_len=100):
+        """
+        hierarchy: list, e.g. [32, 8] 表示 Level 1 有 32 个 Patch，Level 2 有 8 个 Patch
+        """
+        super().__init__()
+        self.N = N
+        self.hierarchy = hierarchy
+        self.levels = len(hierarchy)
+        
+        # 注册静态坐标
+        self.register_buffer('coords', torch.tensor(coords).float())
+        
+        # --- 1. 构建多层 Poolers ---
+        # 每一层 Pooler 负责将 Current Dim -> Next Dim
+        self.poolers = nn.ModuleList()
+        
+        # --- 2. 构建多层 Causal Models ---
+        # 每一层 Coarse Model 负责在 Next Dim 上进行预测
+        self.coarse_models = nn.ModuleList()
+        
+        current_dim = N # 初始为原始节点数
+        
+        for h_dim in hierarchy:
+            # Pooler: N_prev -> N_curr
+            self.poolers.append(LearnableSpatialPooler(input_seq_len=seq_len, k_patches=h_dim))
+            
+            # Causal Model: N_curr
+            self.coarse_models.append(CausalFormer(N=h_dim, latent_C=latent_C, d_model=d_model))
+            
+            current_dim = h_dim
+            
+        # --- 3. Fine Model (最底层的模型) ---
         self.fine_model = CausalFormer(N=N, latent_C=latent_C, d_model=d_model)
         self.register_buffer('psi_mask', torch.ones(latent_C, N, N))
         
-    def forward(self, x, mode='fine'):
-        if mode == 'coarse':
-            # 1. 聚合
-            x_patch = self.aggregate_to_patches(x)
-            # 2. 运行 coarse model
-            # 返回 output 和 target(x_patch) 方便计算 loss
-            return self.coarse_model(x_patch), x_patch
+        # 缓存每一层的 S 矩阵 (List of Tensors)
+        self.S_list = [None] * self.levels 
+
+    @property
+    def patch_labels(self):
+        """
+        用于可视化：返回第一层聚类结果 (Fine -> Level 1)
+        """
+        if self.S_list[0] is None:
+            return np.zeros(self.N)
+        # (B, N, K) -> Mean over Batch -> Argmax
+        return self.S_list[0].mean(0).argmax(dim=-1).detach().cpu().numpy()
+
+    def forward(self, x, mode='fine', tau=1.0):
+        # x: (B, N, T)
+        
+        if mode == 'hierarchy':
+            # 存储每一层的输出，用于计算 Loss
+            results = [] 
+            
+            curr_x = x
+            curr_coords = self.coords
+            
+            for i in range(self.levels):
+                # 1. Pooler: Learn S (B, N_prev, N_curr)
+                S, _ = self.poolers[i](curr_x, curr_coords, temperature=tau)
+                self.S_list[i] = S.detach() # 缓存用于 Mask 生成
+                
+                # 2. Aggregation (Coarsening)
+                # X_curr = S^T @ X_prev
+                S_trans = S.transpose(1, 2)
+                # 归一化 S 转置，避免数值膨胀
+                S_norm = S_trans / (S_trans.sum(dim=-1, keepdim=True) + 1e-6)
+                
+                next_x = torch.bmm(S_norm, curr_x)
+                
+                # 3. Coords Aggregation (用于下一层聚类)
+                # Coords_curr = S_norm @ Coords_prev
+                coords_batch = curr_coords.unsqueeze(0).repeat(x.shape[0], 1, 1) # (B, N, 2)
+                next_coords_batch = torch.bmm(S_norm, coords_batch)
+                curr_coords = next_coords_batch.mean(dim=0) # 简化：取平均
+                
+                # 4. Run Causal Model at this level
+                model_out = self.coarse_models[i](next_x)
+                
+                results.append({
+                    'out': model_out,    # (rec, pred, z)
+                    'target': next_x,    # 用于计算 Recon Loss
+                    'S': S               # 用于计算 Entropy Loss
+                })
+                
+                # 传递给下一层
+                curr_x = next_x
+                
+            return results
             
         elif mode == 'fine':
-            # Fine 阶段逻辑
-            # 1. 应用 mask (注意：mask 更新最好放在 forward 里或 forward 前，这里保持原有逻辑)
+            # Fine 阶段只需应用 Mask
             self.fine_model.Psi.data.mul_(self.psi_mask.to(x.device))
-            # 2. 运行 fine model
             return self.fine_model(x)
         
         else:
             raise ValueError(f"Unknown mode: {mode}")
 
-    def aggregate_to_patches(self, x):
-        B, N, T = x.shape
-        patch_x = torch.zeros(B, self.k_patches, T, device=x.device)
-        for k in range(self.k_patches):
-            idx = np.where(self.patch_labels == k)[0]
-            if len(idx) > 0:
-                patch_x[:, k, :] = x[:, idx, :].mean(dim=1)
-        return patch_x
-
     def update_mask(self, threshold=None):
-        patch_graph = self.coarse_model.static_causal_aggregation().cpu()
+        """
+        级联 Mask 生成: Top -> ... -> Mid -> Fine
+        """
+        # 1. 获取最顶层的图 (Top Level Graph)
+        top_model = self.coarse_models[-1]
+        top_graph = top_model.static_causal_aggregation().detach().cpu()
         
         if threshold is None:
-            mask_diag = ~torch.eye(self.k_patches, dtype=torch.bool)
-            off_diag_values = patch_graph[mask_diag]
+            mask_diag = ~torch.eye(top_graph.shape[0], dtype=torch.bool)
+            off_diag_values = top_graph[mask_diag]
             threshold = off_diag_values.mean() + 0.5 * off_diag_values.std()
             
-        mask = torch.zeros((self.N, self.N))
-        patch_binary = (patch_graph > threshold).float()
+        # 初始 Mask (Top Level)
+        curr_mask = (top_graph > threshold).float()
         
-        for p_tgt in range(self.k_patches):
-            for p_src in range(self.k_patches):
-                if patch_binary[p_tgt, p_src] > 0 or p_tgt == p_src:
-                    src_idx = np.where(self.patch_labels == p_src)[0]
-                    tgt_idx = np.where(self.patch_labels == p_tgt)[0]
-                    for t in tgt_idx:
-                        mask[t, src_idx] = 1.0
-                        
-        target_device = self.fine_model.Psi.device 
-        self.psi_mask = mask.unsqueeze(0).repeat(self.fine_model.C, 1, 1).to(target_device)
-        return patch_graph, threshold, self.psi_mask.mean().item()
-
-    def forward_fine(self, x):
-        # 应用 mask
-        self.fine_model.Psi.data.mul_(self.psi_mask.to(x.device))
-        return self.fine_model(x)
+        # 2. 逐层向下投影 (Back-projection)
+        # S_list: [L0->L1, L1->L2, ...]
+        # 反向遍历: L(n-1)->L(n) ... L0->L1
+        for i in range(self.levels - 1, -1, -1):
+            S = self.S_list[i]
+            if S is None:
+                # Fallback
+                curr_dim = self.hierarchy[i]
+                prev_dim = self.N if i == 0 else self.hierarchy[i-1]
+                curr_mask = torch.ones(prev_dim, prev_dim)
+                continue
+            
+            # S: (B, N_child, N_parent)
+            S_avg = S.mean(dim=0).cpu()
+            parents = S_avg.argmax(dim=1).numpy() # 每个子节点所属的父节点 ID
+            
+            n_child = S_avg.shape[0]
+            next_mask = torch.zeros(n_child, n_child)
+            
+            # 投影逻辑: 如果 Parent A -> Parent B，则所有属于 A 的 child -> 所有属于 B 的 child
+            for c_tgt in range(n_child):
+                for c_src in range(n_child):
+                    p_tgt = parents[c_tgt]
+                    p_src = parents[c_src]
+                    
+                    # 连接条件: 父节点之间有连接 OR 同一个父节点内
+                    if curr_mask[p_tgt, p_src] > 0 or p_tgt == p_src:
+                        next_mask[c_tgt, c_src] = 1.0
+            
+            curr_mask = next_mask
+            
+        # 循环结束时，curr_mask 已经是 Fine Level Mask
+        target_device = self.fine_model.Psi.device
+        self.psi_mask = curr_mask.unsqueeze(0).repeat(self.fine_model.C, 1, 1).to(target_device)
+        
+        # 返回顶层图用于展示
+        return top_graph, threshold, self.psi_mask.mean().item()
