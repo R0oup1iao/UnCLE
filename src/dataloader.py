@@ -89,10 +89,21 @@ def get_data_context(args):
     # 加载数据 (兼容模式)
     data_np, gt_np, coords_np = load_from_disk(base_path, dataset_name, replica_id)
 
-    # 标准化 (Z-Score)
+    # 1. 时序数据标准化 (Z-Score)
+    # 这一步对 Transformer 训练稳定至关重要
     mean = data_np.mean(axis=0)
     std = data_np.std(axis=0) + 1e-5
     data_np = (data_np - mean) / std
+
+    # 2. [关键修复] 坐标数据归一化 (Min-Max -> [-1, 1])
+    # 防止坐标数值过大（如经纬度或米制坐标）主导 LearnableSpatialPooler 的线性层，导致梯度消失或模式坍塌。
+    c_min = coords_np.min(axis=0)
+    c_max = coords_np.max(axis=0)
+    denom = c_max - c_min
+    denom[denom == 0] = 1.0 # 防止除以0
+    
+    coords_np = 2 * (coords_np - c_min) / denom - 1.0
+    print(f"📏 Coords Normalized to [-1, 1]. Original Shape: {coords_np.shape}")
 
     train_ds = CausalTimeSeriesDataset(data_np, window_size, stride, mode='train')
     val_ds = CausalTimeSeriesDataset(data_np, window_size, stride, mode='val')
