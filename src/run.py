@@ -1,3 +1,4 @@
+import datetime
 import sys
 import os
 import argparse
@@ -177,7 +178,7 @@ def train_phase_hierarchy(model, loader, optimizer, accelerator, args):
             unwrapped = accelerator.unwrap_model(model)
             l1_loss = 0.0
             for cm in unwrapped.coarse_models:
-                l1_loss += 2e-3 * cm.psi_l1()
+                l1_loss += args.lambda_l1 * cm.psi_l1()
             
             loss = total_loss + l1_loss
             accelerator.backward(loss)
@@ -236,6 +237,9 @@ def main(args):
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(log_with="wandb", project_dir=args.output_dir, kwargs_handlers=[ddp_kwargs])
     set_seed(args.seed)
+    
+    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    args.output_dir = os.path.join(args.output_dir, args.dataset, timestamp)
     
     if accelerator.is_main_process:
         if not os.path.exists(args.output_dir): os.makedirs(args.output_dir)
@@ -355,6 +359,7 @@ if __name__ == "__main__":
     parser.add_argument("--data_path", type=str, default="data/synthetic")
     parser.add_argument("--replica_id", type=int, default=0)
     parser.add_argument("--N", type=int, default=128)
+    parser.add_argument("--norm_coords", action="store_true")
     parser.add_argument("--hierarchy", type=int, nargs='+', default=[32, 8])
     parser.add_argument("--latent_C", type=int, default=8)
     parser.add_argument("--d_model", type=int, default=64)
@@ -372,6 +377,7 @@ if __name__ == "__main__":
     
     parser.add_argument("--lambda_ent", type=float, default=1e-3)
     parser.add_argument("--lambda_bal", type=float, default=1.0)
+    parser.add_argument("--lambda_l1", type=float, default=2e-3)
     parser.add_argument("--tau_decay", type=float, default=0.01)
     parser.add_argument("--k_patches", type=int, default=8)
 

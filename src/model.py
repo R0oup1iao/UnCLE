@@ -88,17 +88,17 @@ class CausalFormer(nn.Module):
 # DiffPool Components
 # ==========================================
 class LearnableSpatialPooler(nn.Module):
-    def __init__(self, input_seq_len, k_patches):
+    def __init__(self, input_seq_len, k_patches, d_model=64):
         super().__init__()
         # 输入特征: 时间序列长度 (T) + 空间坐标 (2)
         self.input_dim = input_seq_len + 2
         
         self.net = nn.Sequential(
-            nn.Linear(self.input_dim, 128),
+            nn.Linear(self.input_dim, d_model * 2),
             nn.ReLU(),
-            nn.Linear(128, 64),
+            nn.Linear(d_model * 2, d_model),
             nn.ReLU(),
-            nn.Linear(64, k_patches)
+            nn.Linear(d_model, k_patches)
         )
         
     def forward(self, x, coords, temperature=1.0):
@@ -151,7 +151,7 @@ class ST_CausalFormer(nn.Module):
         
         for h_dim in hierarchy:
             # Pooler: N_prev -> N_curr
-            self.poolers.append(LearnableSpatialPooler(input_seq_len=seq_len, k_patches=h_dim))
+            self.poolers.append(LearnableSpatialPooler(input_seq_len=seq_len, k_patches=h_dim, d_model=d_model))
             
             # Causal Model: N_curr
             self.coarse_models.append(CausalFormer(N=h_dim, latent_C=latent_C, d_model=d_model))

@@ -41,7 +41,6 @@ class CausalTimeSeriesDataset(Dataset):
 def load_from_disk(base_path, dataset_name, replica_id):
     """
     读取磁盘文件 (Numpy格式)。
-    [修改] 增加对真实数据的兼容性：GT 和 Coords 如果不存在，则返回默认值。
     """
     data_dir = os.path.join(base_path, dataset_name)
     data_path = os.path.join(data_dir, f'data_{replica_id}.npy')
@@ -54,19 +53,18 @@ def load_from_disk(base_path, dataset_name, replica_id):
     data_np = np.load(data_path) # Shape: (T, N)
     N = data_np.shape[1]
 
-    # 2. GT 是可选的 (真实数据通常没有)
+    # 2. GT 是可选的
     if os.path.exists(gt_path):
         gt_np = np.load(gt_path) # Shape: (N, N)
     else:
         print(f"⚠️ Warning: Ground Truth not found at {gt_path}. Metrics will be skipped.")
         gt_np = None
 
-    # 3. Coords 也是可选的 (如果没有，随机生成以适配 ST_CausalFormer)
+    # 3. Coords 也是可选的
     if os.path.exists(coords_path):
         coords_np = np.load(coords_path) # Shape: (N, 2)
     else:
-        print(f"⚠️ Warning: Coords not found at {coords_path}. Using random coordinates for spatial clustering.")
-        # 生成随机坐标 (N, 2)
+        print(f"⚠️ Warning: Coords not found at {coords_path}. Using random coordinates.")
         np.random.seed(42)
         coords_np = np.random.rand(N, 2)
     
@@ -83,27 +81,25 @@ def get_data_context(args):
     window_size = getattr(args, 'window_size', 100) 
     stride = getattr(args, 'stride', 10)
     batch_size = getattr(args, 'batch_size', 32)
+    norm_coords = getattr(args, 'norm_coords', False)
 
     print(f"📂 Loading {dataset_name} (Replica {replica_id})...")
     
-    # 加载数据 (兼容模式)
     data_np, gt_np, coords_np = load_from_disk(base_path, dataset_name, replica_id)
 
-    # 1. 时序数据标准化 (Z-Score)
-    # 这一步对 Transformer 训练稳定至关重要
+    # 1. 时序数据标准化 (Z-Score) - 始终执行
     mean = data_np.mean(axis=0)
     std = data_np.std(axis=0) + 1e-5
     data_np = (data_np - mean) / std
 
-    # 2. [关键修复] 坐标数据归一化 (Min-Max -> [-1, 1])
-    # 防止坐标数值过大（如经纬度或米制坐标）主导 LearnableSpatialPooler 的线性层，导致梯度消失或模式坍塌。
-    c_min = coords_np.min(axis=0)
-    c_max = coords_np.max(axis=0)
-    denom = c_max - c_min
-    denom[denom == 0] = 1.0 # 防止除以0
-    
-    coords_np = 2 * (coords_np - c_min) / denom - 1.0
-    print(f"📏 Coords Normalized to [-1, 1]. Original Shape: {coords_np.shape}")
+    # 2. 坐标数据归一化 (可选 + Z-Score)
+    if norm_coords:
+        print("📏 Normalizing coordinates (Z-Score)...")
+        c_mean = coords_np.mean(axis=0)
+        c_std = coords_np.std(axis=0) + 1e-5
+        coords_np = (coords_np - c_mean) / c_std
+    else:
+        print("🛡️ Using raw coordinates (Normalization Skipped).")
 
     train_ds = CausalTimeSeriesDataset(data_np, window_size, stride, mode='train')
     val_ds = CausalTimeSeriesDataset(data_np, window_size, stride, mode='val')
@@ -115,7 +111,7 @@ def get_data_context(args):
 
     meta = {
         "coords": coords_np,
-        "gt_fine": gt_np,   # 可能是 None
+        "gt_fine": gt_np,
         "gt_coarse": None, 
         "patch_ids": None
     }
