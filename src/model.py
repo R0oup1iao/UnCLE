@@ -138,6 +138,12 @@ class LearnableSpatialPooler(nn.Module):
         )
 
         # 2. Time Series Encoder
+        self.ts_enc = nn.Sequential(
+            nn.Linear(seq_len, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(), 
+            nn.Linear(d_model, d_model)
+        )
         self.ts_proj = nn.Linear(seq_len, d_model)
         self.ts_norm = nn.LayerNorm(d_model)
         self.ts_act = nn.GELU()

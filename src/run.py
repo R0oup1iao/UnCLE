@@ -6,7 +6,8 @@ import torch.nn.functional as F
 import wandb
 import numpy as np
 import datetime
-from accelerate import Accelerator, DistributedDataParallelKwargs
+from datetime import timedelta
+from accelerate import Accelerator, DistributedDataParallelKwargs, InitProcessGroupKwargs
 from accelerate.utils import set_seed
 from tqdm.auto import tqdm
 
@@ -80,8 +81,16 @@ def train_one_epoch(model, loader, optimizer, accelerator, args, epoch):
 # Main
 # ==========================================
 def main(args):
-    # 1. Setup Accelerator with DDP
-    accelerator = Accelerator(log_with="wandb", project_dir=args.output_dir)
+    # 1. Setup Accelerator with DDP & Timeout
+    # 设置 3 小时超时，防止大图计算时被 Kill
+    init_kwargs = InitProcessGroupKwargs(timeout=timedelta(minutes=180))
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    
+    accelerator = Accelerator(
+        log_with="wandb", 
+        project_dir=args.output_dir,
+        kwargs_handlers=[init_kwargs, ddp_kwargs]
+    )
     set_seed(args.seed)
     
     # 2. Timestamped Output Directory
