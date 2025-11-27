@@ -138,6 +138,12 @@ class LearnableSpatialPooler(nn.Module):
         )
 
         # 2. Time Series Encoder
+        self.ts_enc = nn.Sequential(
+            nn.Linear(seq_len, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(), 
+            nn.Linear(d_model, d_model)
+        )
         self.ts_proj = nn.Linear(seq_len, d_model)
         self.ts_norm = nn.LayerNorm(d_model)
         self.ts_act = nn.GELU()
@@ -161,8 +167,7 @@ class LearnableSpatialPooler(nn.Module):
         coords_norm = (coords - c_mean) / c_std 
 
         c_emb = self.coord_enc(coords_norm).unsqueeze(0).expand(B, -1, -1)
-        t_emb = self.ts_proj(x)
-        t_emb = self.ts_act(self.ts_norm(t_emb))
+        t_emb = self.ts_enc(x)
 
         combined = torch.cat([t_emb, c_emb], dim=-1)
         logits_sem = self.mixer(combined)
