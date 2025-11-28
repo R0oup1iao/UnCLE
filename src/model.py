@@ -40,8 +40,10 @@ class CausalTransformerBlock(nn.Module):
         B, T, C = x.shape
         x = self.input_proj(x)
         x = self.pos_encoder(x)
-        mask = self._generate_square_subsequent_mask(T).to(x.device)
-        out = self.transformer(x, mask=mask, is_causal=True)
+        if not hasattr(self, 'causal_mask') or self.causal_mask.size(0) != T:
+            mask = self._generate_square_subsequent_mask(T).to(x.device)
+            self.register_buffer('causal_mask', mask, persistent=False)
+        out = self.transformer(x, mask=self.causal_mask, is_causal=True)
         return self.output_proj(out)
 
 # --- Causal Graph Layer ---
@@ -79,11 +81,9 @@ class CausalGraphLayer(nn.Module):
         return z_out.permute(0, 3, 1, 2).contiguous()
 
     def structural_l1_loss(self):
-        """L1 regularization on adjacency matrix"""
         return torch.sum(torch.abs(self.adjacency))
     
     def get_soft_graph(self):
-        """Get continuous connection strength matrix"""
         with torch.no_grad():
             w_mag = torch.mean(torch.abs(self.weights), dim=0)
             a_mag = torch.abs(self.adjacency)
@@ -325,35 +325,43 @@ class ST_CausalFormer(nn.Module):
             })
             
         return results
-
     def update_hard_mask(self):
-        """Update hard masks based on learned soft graphs"""
+        """
+        Vectorized update of hard masks.
+        Replaces O(N^2) loops with efficient Matrix Multiplication.
+        """
         with torch.no_grad():
+            # 1. Update Top Level
             top_graph = self.layers[-1].graph.get_soft_graph()
-            mask_diag = ~torch.eye(top_graph.shape[0], dtype=torch.bool, device=top_graph.device)
-            vals = top_graph[mask_diag]
-            if vals.numel() == 0:
-                thresh = 0.0
-            else:
-                thresh = vals.mean() + 0.5 * vals.std()
+            # Dynamic thresholding
+            vals = top_graph[~torch.eye(top_graph.shape[0], dtype=bool, device=top_graph.device)]
+            thresh = vals.mean() + 0.5 * vals.std()
             curr_mask = (top_graph > thresh).float()
             
+            # Ensure diagonal is 1 (self-loops allowed for dynamics)
+            curr_mask.fill_diagonal_(1.0)
             self.layers[-1].graph.static_mask.copy_(curr_mask)
             
-            # Propagate mask down the hierarchy
+            # 2. Propagate Down (Vectorized)
             for i in range(self.num_levels - 2, -1, -1):
-                S_avg = getattr(self, f'structure_S_{i}')
+                S_avg = getattr(self, f'structure_S_{i}') # Shape: (N_fine, N_coarse)
                 
+                # Get hard assignments: (N_fine,)
                 parents = S_avg.argmax(dim=1)
-                n_curr = self.dims[i]
-                next_mask = torch.zeros(n_curr, n_curr, device=curr_mask.device)
+                n_fine, n_coarse = S_avg.shape
                 
-                for u in range(n_curr):
-                    for v in range(n_curr):
-                        p_u = parents[u]
-                        p_v = parents[v]
-                        if curr_mask[p_u, p_v] > 0 or p_u == p_v:
-                            next_mask[u, v] = 1.0
+                # Create One-Hot Assignment Matrix P: (N_fine, N_coarse)
+                P = F.one_hot(parents, num_classes=n_coarse).float()
+                
+                # Project Mask: M_fine = P @ M_coarse @ P.T
+                # If coarse nodes i and j are connected, all their children should be connected.
+                projected_mask = P @ curr_mask @ P.t()
+                
+                # Binarize
+                next_mask = (projected_mask > 0).float()
+                
+                # Enforce diagonal (self-loops)
+                next_mask.fill_diagonal_(1.0)
                 
                 self.layers[i].graph.static_mask.copy_(next_mask)
                 curr_mask = next_mask
