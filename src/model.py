@@ -3,9 +3,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import numpy as np
+from sklearn.cluster import KMeans  # 需要安装 scikit-learn
 
 # ==========================================
-# Basic Components (Transformer, PE)
+# 基础组件 (Transformer, PE)
 # ==========================================
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=5000):
@@ -73,8 +74,6 @@ class CausalGraphLayer(nn.Module):
             mask = mask * dynamic_mask
 
         # --- Effective Weights ---
-        # No hard thresholding inside the model.
-        # We multiply adjacency directly. L1 loss on adjacency will drive small values to near zero.
         # eff_weights: (C, N, N)
         eff_weights = self.weights * self.adjacency.unsqueeze(0) * mask.unsqueeze(0)
         
@@ -122,13 +121,14 @@ class CausalFormer(nn.Module):
         return x_recon, x_pred, z
 
 # ==========================================
-# Elegant Learnable Spatial Pooler
+# Updated Learnable Spatial Pooler (With K-Means)
 # ==========================================
 class LearnableSpatialPooler(nn.Module):
     def __init__(self, seq_len, num_patches, d_model=64):
         super().__init__()
         self.num_patches = num_patches
         self.d_model = d_model
+        self.initialized = False # 标记是否已经用 KMeans 初始化过
 
         # 1. Coordinate Encoder
         self.coord_enc = nn.Sequential(
@@ -154,14 +154,64 @@ class LearnableSpatialPooler(nn.Module):
             nn.GELU(),
             nn.Linear(d_model, num_patches) 
         )
+        
+        # === 关键修复：零初始化 Mixer 的最后一层 ===
+        # 防止随机初始化的语义特征噪声在初期覆盖掉 K-Means 的空间先验
+        nn.init.zeros_(self.mixer[-1].weight)
+        nn.init.zeros_(self.mixer[-1].bias)
 
         # 4. Spatial Prior
+        # 初始随机，后续会被 init_with_kmeans 覆盖
         self.cluster_centers = nn.Parameter(torch.randn(num_patches, 2))
         self.spatial_gate = nn.Parameter(torch.tensor(0.5))
+
+    def init_with_kmeans(self, coords):
+        """
+        使用 K-Means 初始化 cluster_centers。
+        关键点：需要在归一化后的空间进行聚类，以匹配 forward 中的逻辑。
+        
+        Args:
+            coords: (N, 2) 原始坐标
+        Returns:
+            centers_raw: (num_patches, 2) 反归一化后的中心点，作为下一层的输入坐标
+        """
+        if self.initialized: 
+            return self.cluster_centers.detach() # 如果已经初始化，直接返回当前值（注意：逻辑上这里应该返回反归一化的，但在训练loop外一般只调一次）
+
+        try:
+            # === 1. 模拟 forward 中的归一化 ===
+            c_mean = coords.mean(dim=0, keepdim=True)
+            c_std = coords.std(dim=0, keepdim=True) + 1e-5
+            coords_norm = (coords - c_mean) / c_std
+            
+            # === 2. 运行 KMeans ===
+            coords_np = coords_norm.cpu().numpy()
+            kmeans = KMeans(n_clusters=self.num_patches, n_init=10)
+            kmeans.fit(coords_np)
+            
+            # === 3. 更新参数 ===
+            centers = torch.tensor(kmeans.cluster_centers_, dtype=torch.float32)
+            with torch.no_grad():
+                self.cluster_centers.copy_(centers.to(self.cluster_centers.device))
+            
+            self.initialized = True
+            print(f"✅ Pooler initialized with K-Means (K={self.num_patches})")
+            
+            # === 4. 返回下一层的输入坐标 (反归一化) ===
+            # center_raw = center_norm * std + mean
+            centers_raw = centers.to(coords.device) * c_std + c_mean
+            return centers_raw
+
+        except Exception as e:
+            print(f"⚠️ K-Means init failed: {e}. Keeping random init.")
+            # 降级方案：随机采样点作为下一层的坐标
+            idx = torch.randperm(coords.size(0))[:self.num_patches]
+            return coords[idx]
 
     def forward(self, x, coords, temperature=1.0):
         B, N, T = x.shape
         
+        # 归一化坐标，这必须与 init_with_kmeans 中的预处理一致
         c_mean = coords.mean(dim=0, keepdim=True)
         c_std = coords.std(dim=0, keepdim=True) + 1e-5
         coords_norm = (coords - c_mean) / c_std 
@@ -170,8 +220,11 @@ class LearnableSpatialPooler(nn.Module):
         t_emb = self.ts_enc(x)
 
         combined = torch.cat([t_emb, c_emb], dim=-1)
+        
+        # mixer 输出的 logits_sem 在初期会非常接近 0
         logits_sem = self.mixer(combined)
 
+        # 计算距离 (基于归一化后的坐标和中心)
         dists = torch.cdist(coords_norm, self.cluster_centers)
         logits_spatial = -dists.pow(2).unsqueeze(0).expand(B, -1, -1)
 
@@ -194,7 +247,11 @@ class ST_CausalFormer(nn.Module):
         super().__init__()
         self.dims = [N] + hierarchy
         self.num_levels = len(self.dims)
-        self.register_buffer('coords', torch.tensor(coords).float())
+        
+        # 确保 coords 是 tensor
+        if not torch.is_tensor(coords):
+            coords = torch.tensor(coords).float()
+        self.register_buffer('coords', coords)
         
         self.layers = nn.ModuleList()
         self.poolers = nn.ModuleList()
@@ -207,7 +264,25 @@ class ST_CausalFormer(nn.Module):
                     num_patches=self.dims[i+1], 
                     d_model=d_model
                 ))
+        
+        # === 核心修改：初始化时执行逐层聚类 ===
+        self._init_hierarchy_with_kmeans()
                 
+    def _init_hierarchy_with_kmeans(self):
+        """
+        利用当前层的坐标初始化当前层的 pooler，
+        并计算出质心作为下一层的坐标。
+        """
+        current_coords = self.coords
+        
+        for pooler in self.poolers:
+            # 1. 用当前坐标初始化 Pooler 的 cluster_centers
+            # 2. 返回新的质心（Raw scale），作为下一层的输入坐标
+            next_coords = pooler.init_with_kmeans(current_coords)
+            
+            # 更新 current_coords 给下一层用
+            current_coords = next_coords
+
     @property
     def fine_model(self):
         return self.layers[0]
