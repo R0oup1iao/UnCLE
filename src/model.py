@@ -332,7 +332,10 @@ class ST_CausalFormer(nn.Module):
             top_graph = self.layers[-1].graph.get_soft_graph()
             mask_diag = ~torch.eye(top_graph.shape[0], dtype=torch.bool, device=top_graph.device)
             vals = top_graph[mask_diag]
-            thresh = vals.mean() + 0.5 * vals.std()
+            if vals.numel() == 0:
+                thresh = 0.0
+            else:
+                thresh = vals.mean() + 0.5 * vals.std()
             curr_mask = (top_graph > thresh).float()
             
             self.layers[-1].graph.static_mask.copy_(curr_mask)
