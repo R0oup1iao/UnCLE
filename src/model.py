@@ -3,11 +3,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import numpy as np
-from sklearn.cluster import KMeans  # 需要安装 scikit-learn
+from sklearn.cluster import KMeans
 
-# ==========================================
-# 基础组件 (Transformer, PE)
-# ==========================================
+# --- Basic Components ---
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=5000):
         super().__init__()
@@ -26,9 +24,10 @@ class CausalTransformerBlock(nn.Module):
         super().__init__()
         self.input_proj = nn.Linear(input_dim, d_model)
         self.pos_encoder = PositionalEncoding(d_model)
-        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, 
-                                                   dim_feedforward=d_model*2, 
-                                                   dropout=dropout, batch_first=True, norm_first=True)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=d_model*2, 
+            dropout=dropout, batch_first=True, norm_first=True
+        )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.output_proj = nn.Linear(d_model, output_dim)
 
@@ -45,54 +44,47 @@ class CausalTransformerBlock(nn.Module):
         out = self.transformer(x, mask=mask, is_causal=True)
         return self.output_proj(out)
 
-# ==========================================
-# Causal Graph Layer (Clean & Continuous)
-# ==========================================
+# --- Causal Graph Layer ---
 class CausalGraphLayer(nn.Module):
     def __init__(self, N, C):
         super().__init__()
         self.N = N
         self.C = C
         
-        # Initialization: Start dense (near 1.0), prune via L1
+        # Start dense and prune via L1
         self.adjacency = nn.Parameter(torch.ones(N, N) * 0.9 + torch.randn(N, N) * 0.05)
-        
-        # Dynamics Weights
         self.weights = nn.Parameter(torch.randn(C, N, N) * 0.02)
-        
-        # Buffer for visualization
         self.register_buffer('static_mask', torch.ones(N, N))
 
     def forward(self, z, dynamic_mask=None):
         """
-        z: (B, N, T, C)
-        dynamic_mask: (N, N)
+        Args:
+            z: (B, N, T, C) input features
+            dynamic_mask: (N, N) optional dynamic mask
+        Returns:
+            z_out: (B, N, T, C) output features
         """
-        # Combine static mask and dynamic mask
         mask = self.static_mask
         if dynamic_mask is not None:
             mask = mask * dynamic_mask
 
-        # --- Effective Weights ---
-        # eff_weights: (C, N, N)
+        # Compute effective weights
         eff_weights = self.weights * self.adjacency.unsqueeze(0) * mask.unsqueeze(0)
         
-        # --- Graph Propagation ---
-        z_in = z.permute(0, 2, 3, 1) # (B, T, C, N)
-        
-        # Einsum: b t c n (src), c n (src) m (tgt) -> b t c m (tgt)
+        # Graph propagation using einsum
+        z_in = z.permute(0, 2, 3, 1)  # (B, T, C, N)
         z_out = torch.einsum('btcn,cnm->btcm', z_in, eff_weights)
-        
         z_out = torch.tanh(z_out)
+        
         return z_out.permute(0, 3, 1, 2).contiguous()
 
     def structural_l1_loss(self):
-        # L1 Loss on the adjacency matrix
+        """L1 regularization on adjacency matrix"""
         return torch.sum(torch.abs(self.adjacency))
     
     def get_soft_graph(self):
+        """Get continuous connection strength matrix"""
         with torch.no_grad():
-            # Return raw continuous values representing connection strength
             w_mag = torch.mean(torch.abs(self.weights), dim=0)
             a_mag = torch.abs(self.adjacency)
             return w_mag * a_mag * self.static_mask
@@ -120,118 +112,102 @@ class CausalFormer(nn.Module):
         x_pred = self.rec_trans(zhat_next[..., :-1, :].contiguous().view(B*N, T-1, self.C)).view(B, N, T-1)
         return x_recon, x_pred, z
 
-# ==========================================
-# Updated Learnable Spatial Pooler (With K-Means)
-# ==========================================
+# --- Learnable Spatial Pooler ---
 class LearnableSpatialPooler(nn.Module):
     def __init__(self, seq_len, num_patches, d_model=64):
         super().__init__()
         self.num_patches = num_patches
         self.d_model = d_model
-        self.initialized = False # 标记是否已经用 KMeans 初始化过
+        self.initialized = False
 
-        # 1. Coordinate Encoder
+        # Coordinate encoder
         self.coord_enc = nn.Sequential(
             nn.Linear(2, d_model),
             nn.GELU(),
             nn.Linear(d_model, d_model)
         )
 
-        # 2. Time Series Encoder
+        # Time series encoder
         self.ts_enc = nn.Sequential(
             nn.Linear(seq_len, d_model),
             nn.LayerNorm(d_model),
             nn.GELU(), 
             nn.Linear(d_model, d_model)
         )
-        self.ts_proj = nn.Linear(seq_len, d_model)
-        self.ts_norm = nn.LayerNorm(d_model)
-        self.ts_act = nn.GELU()
 
-        # 3. Mixer
+        # Mixer for combining spatial and temporal features
         self.mixer = nn.Sequential(
             nn.Linear(d_model * 2, d_model),
             nn.GELU(),
             nn.Linear(d_model, num_patches) 
         )
         
-        # === 关键修复：零初始化 Mixer 的最后一层 ===
-        # 防止随机初始化的语义特征噪声在初期覆盖掉 K-Means 的空间先验
+        # Zero-initialize mixer output to prioritize spatial prior initially
         nn.init.zeros_(self.mixer[-1].weight)
         nn.init.zeros_(self.mixer[-1].bias)
 
-        # 4. Spatial Prior
-        # 初始随机，后续会被 init_with_kmeans 覆盖
+        # Cluster centers and spatial gate
         self.cluster_centers = nn.Parameter(torch.randn(num_patches, 2))
         self.spatial_gate = nn.Parameter(torch.tensor(0.5))
 
     def init_with_kmeans(self, coords):
-        """
-        使用 K-Means 初始化 cluster_centers。
-        关键点：需要在归一化后的空间进行聚类，以匹配 forward 中的逻辑。
-        
-        Args:
-            coords: (N, 2) 原始坐标
-        Returns:
-            centers_raw: (num_patches, 2) 反归一化后的中心点，作为下一层的输入坐标
-        """
+        """Initialize cluster centers using K-Means clustering"""
         if self.initialized: 
-            return self.cluster_centers.detach() # 如果已经初始化，直接返回当前值（注意：逻辑上这里应该返回反归一化的，但在训练loop外一般只调一次）
+            return self.cluster_centers.detach()
 
         try:
-            # === 1. 模拟 forward 中的归一化 ===
+            # Normalize coordinates for clustering
             c_mean = coords.mean(dim=0, keepdim=True)
             c_std = coords.std(dim=0, keepdim=True) + 1e-5
             coords_norm = (coords - c_mean) / c_std
             
-            # === 2. 运行 KMeans ===
+            # Run K-Means
             coords_np = coords_norm.cpu().numpy()
             kmeans = KMeans(n_clusters=self.num_patches, n_init=10)
             kmeans.fit(coords_np)
             
-            # === 3. 更新参数 ===
+            # Update cluster centers
             centers = torch.tensor(kmeans.cluster_centers_, dtype=torch.float32)
             with torch.no_grad():
                 self.cluster_centers.copy_(centers.to(self.cluster_centers.device))
             
             self.initialized = True
-            print(f"✅ Pooler initialized with K-Means (K={self.num_patches})")
+            print(f"Pooler initialized with K-Means (K={self.num_patches})")
             
-            # === 4. 返回下一层的输入坐标 (反归一化) ===
-            # center_raw = center_norm * std + mean
+            # Return denormalized centers for next layer
             centers_raw = centers.to(coords.device) * c_std + c_mean
             return centers_raw
 
         except Exception as e:
-            print(f"⚠️ K-Means init failed: {e}. Keeping random init.")
-            # 降级方案：随机采样点作为下一层的坐标
+            print(f"K-Means init failed: {e}. Using random initialization.")
             idx = torch.randperm(coords.size(0))[:self.num_patches]
             return coords[idx]
 
     def forward(self, x, coords, temperature=1.0):
+        """Forward pass for spatial pooling"""
         B, N, T = x.shape
         
-        # 归一化坐标，这必须与 init_with_kmeans 中的预处理一致
+        # Normalize coordinates (consistent with init_with_kmeans)
         c_mean = coords.mean(dim=0, keepdim=True)
         c_std = coords.std(dim=0, keepdim=True) + 1e-5
         coords_norm = (coords - c_mean) / c_std 
 
+        # Compute embeddings
         c_emb = self.coord_enc(coords_norm).unsqueeze(0).expand(B, -1, -1)
         t_emb = self.ts_enc(x)
-
         combined = torch.cat([t_emb, c_emb], dim=-1)
         
-        # mixer 输出的 logits_sem 在初期会非常接近 0
+        # Compute semantic and spatial logits
         logits_sem = self.mixer(combined)
-
-        # 计算距离 (基于归一化后的坐标和中心)
         dists = torch.cdist(coords_norm, self.cluster_centers)
         logits_spatial = -dists.pow(2).unsqueeze(0).expand(B, -1, -1)
 
+        # Combine logits with learnable gate
         alpha = F.softplus(self.spatial_gate)
         final_logits = logits_sem + alpha * logits_spatial
         final_logits = torch.clamp(final_logits, min=-10.0, max=10.0)
 
+        # Compute soft assignment matrix
         if self.training:
             S = F.gumbel_softmax(final_logits, tau=temperature, hard=False, dim=-1)
         else:
@@ -239,23 +215,25 @@ class LearnableSpatialPooler(nn.Module):
             
         return S
 
-# ==========================================
-# Unified Hierarchy Model
-# ==========================================
+# --- Unified Hierarchy Model ---
 class ST_CausalFormer(nn.Module):
     def __init__(self, N, coords, hierarchy=[32, 8], latent_C=8, d_model=64, seq_len=100):
         super().__init__()
         self.dims = [N] + hierarchy
         self.num_levels = len(self.dims)
         
-        # 确保 coords 是 tensor
+        # Ensure coords is a tensor
         if not torch.is_tensor(coords):
             coords = torch.tensor(coords).float()
         self.register_buffer('coords', coords)
         
+        # Initialize layers and poolers
         self.layers = nn.ModuleList()
         self.poolers = nn.ModuleList()
         
+        for i in range(self.num_levels - 1):
+            self.register_buffer(f'structure_S_{i}', torch.zeros(self.dims[i], self.dims[i+1]))
+
         for i in range(self.num_levels):
             self.layers.append(CausalFormer(N=self.dims[i], latent_C=latent_C, d_model=d_model))
             if i < self.num_levels - 1:
@@ -265,22 +243,16 @@ class ST_CausalFormer(nn.Module):
                     d_model=d_model
                 ))
         
-        # === 核心修改：初始化时执行逐层聚类 ===
         self._init_hierarchy_with_kmeans()
-                
+        
+        self.last_S = [] 
+
     def _init_hierarchy_with_kmeans(self):
-        """
-        利用当前层的坐标初始化当前层的 pooler，
-        并计算出质心作为下一层的坐标。
-        """
+        """Initialize each pooler layer using K-Means clustering"""
         current_coords = self.coords
         
         for pooler in self.poolers:
-            # 1. 用当前坐标初始化 Pooler 的 cluster_centers
-            # 2. 返回新的质心（Raw scale），作为下一层的输入坐标
             next_coords = pooler.init_with_kmeans(current_coords)
-            
-            # 更新 current_coords 给下一层用
             current_coords = next_coords
 
     @property
@@ -289,7 +261,10 @@ class ST_CausalFormer(nn.Module):
 
     @property
     def patch_labels(self):
-        if hasattr(self, 'last_S') and len(self.last_S) > 0:
+        """Get patch assignment labels"""
+        if hasattr(self, 'structure_S_0'):
+             return getattr(self, 'structure_S_0').argmax(dim=-1).detach().cpu().numpy()
+        elif len(self.last_S) > 0:
             return self.last_S[0].mean(0).argmax(dim=-1).detach().cpu().numpy()
         return np.zeros(self.dims[0])
 
@@ -299,7 +274,7 @@ class ST_CausalFormer(nn.Module):
     def forward(self, x, tau=1.0):
         B = x.shape[0]
         
-        # --- Step 1: Bottom-Up Pass ---
+        # Bottom-up pass: spatial pooling
         xs = [x]
         curr_coords = self.coords
         S_list = []
@@ -308,6 +283,10 @@ class ST_CausalFormer(nn.Module):
             S = self.poolers[i](xs[-1], curr_coords, temperature=tau)
             S_list.append(S)
             
+            with torch.no_grad():
+                avg_S = S.mean(dim=0).detach()
+                getattr(self, f'structure_S_{i}').copy_(avg_S)
+
             S_trans = S.transpose(1, 2)
             S_norm = S_trans / (S_trans.sum(dim=-1, keepdim=True) + 1e-6)
             
@@ -320,7 +299,7 @@ class ST_CausalFormer(nn.Module):
             
         self.last_S = [s.detach() for s in S_list]
         
-        # --- Step 2: Top-Down Pass ---
+        # Top-down pass: mask propagation
         masks = [None] * self.num_levels
         top_adj = self.layers[-1].graph.get_soft_graph() 
         current_mask = top_adj
@@ -331,7 +310,7 @@ class ST_CausalFormer(nn.Module):
             masks[i] = projected_mask
             current_mask = projected_mask
 
-        # --- Step 3: Parallel Causal Discovery ---
+        # Parallel causal discovery at all levels
         results = []
         for i in range(self.num_levels):
             mask_in = masks[i] if i < self.num_levels - 1 else None
@@ -348,6 +327,7 @@ class ST_CausalFormer(nn.Module):
         return results
 
     def update_hard_mask(self):
+        """Update hard masks based on learned soft graphs"""
         with torch.no_grad():
             top_graph = self.layers[-1].graph.get_soft_graph()
             mask_diag = ~torch.eye(top_graph.shape[0], dtype=torch.bool, device=top_graph.device)
@@ -357,11 +337,14 @@ class ST_CausalFormer(nn.Module):
             
             self.layers[-1].graph.static_mask.copy_(curr_mask)
             
+            # Propagate mask down the hierarchy
             for i in range(self.num_levels - 2, -1, -1):
-                S_avg = self.last_S[i].mean(dim=0)
+                S_avg = getattr(self, f'structure_S_{i}')
+                
                 parents = S_avg.argmax(dim=1)
                 n_curr = self.dims[i]
                 next_mask = torch.zeros(n_curr, n_curr, device=curr_mask.device)
+                
                 for u in range(n_curr):
                     for v in range(n_curr):
                         p_u = parents[u]

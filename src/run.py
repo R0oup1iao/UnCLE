@@ -1,24 +1,20 @@
-import sys
 import os
 import argparse
+import datetime
 import torch
 import torch.nn.functional as F
 import wandb
 import numpy as np
-import datetime
-from datetime import timedelta
-from accelerate import Accelerator, DistributedDataParallelKwargs, InitProcessGroupKwargs
+from accelerate import Accelerator
 from accelerate.utils import set_seed
 from tqdm.auto import tqdm
 
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from model import ST_CausalFormer
 from dataloader import get_data_context
 from evaluate import run_full_evaluation
+from metrics import count_accuracy
 
-# ==========================================
-# Helpers
-# ==========================================
+# --- Helper Functions ---
 def compute_entropy_loss(S):
     entropy = -torch.sum(S * torch.log(S + 1e-6), dim=-1)
     return entropy.mean()
@@ -30,35 +26,25 @@ def compute_balance_loss(S):
     max_entropy = np.log(K)
     return neg_entropy + max_entropy
 
-# ==========================================
-# Training
-# ==========================================
+# --- Training Functions ---
 def train_one_epoch(model, loader, optimizer, accelerator, args, epoch):
-    model.train() 
+    model.train()
     total_loss = 0.0
-    
-    # Anneal Tau: 1.0 -> 0.1
-    tau = max(0.1, np.exp(-epoch * args.tau_decay))
+    tau = max(0.1, np.exp(-epoch * args.tau_decay))  # Anneal temperature
     
     for batch in loader:
-        if isinstance(batch, (list, tuple)): x = batch[0]
-        else: x = batch
+        x = batch[0] if isinstance(batch, (list, tuple)) else batch
         
         optimizer.zero_grad()
-        
-        # Unified Forward
         results = model(x, tau=tau)
         
         batch_loss = 0.0
-        
         for res in results:
-            level = res['level']
             x_rec, x_pred, x_target = res['x_rec'], res['x_pred'], res['x_target']
             S = res['S']
             
             l_rec = F.mse_loss(x_rec, x_target)
             l_pre = F.mse_loss(x_pred, x_target[..., 1:])
-            
             batch_loss += (l_rec + l_pre)
             
             if S is not None:
@@ -66,9 +52,7 @@ def train_one_epoch(model, loader, optimizer, accelerator, args, epoch):
                 l_bal = args.lambda_bal * compute_balance_loss(S)
                 batch_loss += l_ent + l_bal
 
-        # Structural Sparsity
         l1_loss = args.lambda_l1 * accelerator.unwrap_model(model).get_structural_l1_loss()
-        
         final_loss = batch_loss + l1_loss
         
         accelerator.backward(final_loss)
@@ -76,38 +60,24 @@ def train_one_epoch(model, loader, optimizer, accelerator, args, epoch):
         total_loss += final_loss.item()
         
     return total_loss / len(loader), tau
-
-# ==========================================
-# Main
-# ==========================================
+# --- Main Function ---
 def main(args):
-    # 1. Setup Accelerator with DDP & Timeout
-    # 设置 3 小时超时，防止大图计算时被 Kill
-    init_kwargs = InitProcessGroupKwargs(timeout=timedelta(minutes=180))
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-    
-    accelerator = Accelerator(
-        log_with="wandb", 
-        project_dir=args.output_dir,
-        kwargs_handlers=[init_kwargs, ddp_kwargs]
-    )
+    accelerator = Accelerator(log_with="wandb", project_dir=args.output_dir)
     set_seed(args.seed)
     
-    # 2. Timestamped Output Directory
+    # Setup output directory
     timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
     args.output_dir = os.path.join(args.output_dir, args.dataset, timestamp)
     
     if accelerator.is_main_process:
-        if not os.path.exists(args.output_dir): os.makedirs(args.output_dir)
-        # Init WandB with new run name
+        os.makedirs(args.output_dir, exist_ok=True)
         run_name = f"{args.dataset}-{timestamp}"
-        accelerator.init_trackers(project_name=args.project_name, config=vars(args), init_kwargs={"wandb": {"name": run_name}})
-        accelerator.print(f"🚀 Experiment: {args.dataset} | Output Dir: {args.output_dir}")
+        accelerator.init_trackers(project_name=args.project_name, config=vars(args), 
+                                init_kwargs={"wandb": {"name": run_name}})
+        accelerator.print(f"Experiment: {args.dataset} | Output Dir: {args.output_dir}")
 
-    # 3. Load Data
+    # Load data and initialize model
     train_loader, val_loader, meta = get_data_context(args)
-
-    # 4. Init Model
     model = ST_CausalFormer(
         N=args.N, 
         coords=meta['coords'], 
@@ -117,51 +87,59 @@ def main(args):
         seq_len=args.window_size
     )
 
-    # 5. Inference Only Logic
+    # Inference-only mode
     if args.inference_only:
         if not args.model_path:
-            raise ValueError("❌ --inference_only requires --model_path to be specified!")
+            raise ValueError("--inference_only requires --model_path to be specified!")
         
-        accelerator.print(f"📥 Loading pre-trained model from {args.model_path}")
+        accelerator.print(f"Loading pre-trained model from {args.model_path}")
         state_dict = torch.load(args.model_path, map_location='cpu')
         model.load_state_dict(state_dict)
         model = model.to(accelerator.device)
         
-        # Run Evaluation directly
         run_full_evaluation(model, args, accelerator, meta)
         accelerator.end_training()
         return
 
-    # 6. Training Setup
+    # Training setup
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     model, optimizer, train_loader, val_loader = accelerator.prepare(
         model, optimizer, train_loader, val_loader
     )
 
-    # 7. Training Loop
+    # Training loop
     epochs = args.epochs
-    progress_bar = tqdm(range(epochs), disable=not accelerator.is_local_main_process, desc="Unified Training")
+    progress_bar = tqdm(range(epochs), disable=not accelerator.is_local_main_process, desc="Training")
     
     for ep in progress_bar:
         loss, tau = train_one_epoch(model, train_loader, optimizer, accelerator, args, ep)
         
         if accelerator.is_main_process:
-            wandb.log({"train/loss": loss, "tau": tau})
-            progress_bar.set_postfix(loss=f"{loss:.4f}", tau=f"{tau:.2f}")
+            log_dict = {"train/loss": loss, "tau": tau}
+            if meta.get('gt_fine') is not None:
+                unwrapped_model = accelerator.unwrap_model(model)
+                est_fine = unwrapped_model.fine_model.graph.get_soft_graph().detach().cpu().numpy()
+                gt_fine = meta['gt_fine']
+                metrics = count_accuracy(gt_fine, est_fine)
+                log_dict.update(metrics)
+            
+            wandb.log(log_dict)
+            
+            postfix_str = f"loss={loss:.4f}, tau={tau:.2f}"
+            if 'F1' in log_dict:
+                postfix_str += f", F1={log_dict['F1']:.4f}"
+            progress_bar.set_postfix_str(postfix_str)
 
-    # 8. Post-Training Wrap-up
+    # Post-training evaluation
     accelerator.wait_for_everyone()
     unwrapped_model = accelerator.unwrap_model(model)
     
     if accelerator.is_main_process:
-        # Save Model
         save_path = os.path.join(args.output_dir, "model.pth")
         torch.save(unwrapped_model.state_dict(), save_path)
-        accelerator.print(f"💾 Model saved to {save_path}")
+        accelerator.print(f"Model saved to {save_path}")
 
-    # 9. Run Full Evaluation
     run_full_evaluation(unwrapped_model, args, accelerator, meta)
-        
     accelerator.end_training()
 
 if __name__ == "__main__":
@@ -172,19 +150,18 @@ if __name__ == "__main__":
     parser.add_argument("--replica_id", type=int, default=0)
     parser.add_argument("--N", type=int, default=128)
     parser.add_argument("--norm_coords", action="store_true")
+    parser.add_argument("--window_size", type=int, default=10)
+    parser.add_argument("--stride", type=int, default=1)
     
     # Model
     parser.add_argument("--hierarchy", type=int, nargs='+', default=[32, 8])
     parser.add_argument("--latent_C", type=int, default=8)
     parser.add_argument("--d_model", type=int, default=64)
-    parser.add_argument("--window_size", type=int, default=10)
-    parser.add_argument("--stride", type=int, default=1)
-    parser.add_argument("--k_patches", type=int, default=8) # Backward compatibility if needed
     
     # Training
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--lr", type=float, default=3e-3)
+    parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--lambda_ent", type=float, default=1e-3)
     parser.add_argument("--lambda_bal", type=float, default=1.0)
     parser.add_argument("--lambda_l1", type=float, default=2e-3)
