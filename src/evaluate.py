@@ -1,4 +1,6 @@
 import os
+import argparse
+import datetime
 import torch
 import torch.nn.functional as F
 from torch.func import jacrev, functional_call
@@ -6,35 +8,60 @@ import numpy as np
 import matplotlib.pyplot as plt
 import wandb
 import json
+from accelerate import Accelerator
 from tqdm.auto import tqdm
-from dataloader import load_from_disk, CausalTimeSeriesDataset
+
+# 确保引入了模型定义和数据加载器
+from model import ST_CausalFormer 
+from dataloader import get_data_context, load_from_disk, CausalTimeSeriesDataset
 from visualize import create_dynamic_gif
 from metrics import count_accuracy
 
-def compute_dynamic_strengths(model, x, device):
+def compute_dynamic_strengths(model, x, device, chunk_size=32):
     """
-    计算动态因果强度 (Jacobian based)
+    计算动态因果强度 (Jacobian based) - 分块版以防止 OOM
+    N=716 时直接计算全量 Jacobian 会炸显存，这里按行切分计算。
     """
     model.eval()
     x_in = x.detach().clone().to(device)  # (1, N, T)
     x_squeeze = x_in.squeeze(0)           # (N, T)
+    N = x_squeeze.shape[0]
     
-    def model_func(input_tensor, params, buffers):
-        batched_input = input_tensor.unsqueeze(0)
-        # 提取 Level 0 (Fine) 的预测
-        results = functional_call(model, (params, buffers), (batched_input,))
-        fine_result = results[0]
-        x_pred = fine_result['x_pred'].squeeze(0)
-        return x_pred.sum(dim=1)
-
     params = dict(model.named_parameters())
     buffers = dict(model.named_buffers())
+    
+    jacobian_chunks = []
+    
+    # --- 分块循环 ---
+    # 每次只计算 chunk_size 个目标节点的梯度
+    for i in range(0, N, chunk_size):
+        end_idx = min(i + chunk_size, N)
+        
+        def sub_model_func(input_tensor, params, buffers):
+            batched_input = input_tensor.unsqueeze(0)
+            # 1. Forward
+            results = functional_call(model, (params, buffers), (batched_input,))
+            fine_result = results[0]
+            x_pred = fine_result['x_pred'].squeeze(0) # (N, T)
+            
+            # 2. 只取当前 chunk 的行进行求和，作为梯度的 Target
+            # 输出: (Chunk_size)
+            return x_pred[i:end_idx].sum(dim=1) 
 
-    # Jacobian: (N_target, N_source, T_source)
-    jacobian = jacrev(model_func, argnums=0)(x_squeeze, params, buffers)
+        # Jacobian: (Chunk_size, N_source, T_source)
+        # 这里只计算部分行的梯度，显存占用变为原来的 chunk_size / N
+        chunk_jac = jacrev(sub_model_func, argnums=0)(x_squeeze, params, buffers)
+        
+        # 立即转到 CPU 并释放 GPU 显存
+        jacobian_chunks.append(chunk_jac.detach().cpu())
+        del chunk_jac
+        torch.cuda.empty_cache()
+
+    # 拼接所有块: (N, N, T)
+    jacobian = torch.cat(jacobian_chunks, dim=0)
     
     # 调整维度并去除最后无效帧
-    dynamic_adj = jacobian.permute(1, 0, 2).abs()
+    dynamic_adj = jacobian.permute(1, 0, 2).abs() # (N_source, N_target, T)
     return dynamic_adj[..., :-1]
 
 def evaluate_static_graphs(model, meta, output_dir, metrics=None):
@@ -44,18 +71,22 @@ def evaluate_static_graphs(model, meta, output_dir, metrics=None):
     # 1. 提取 Fine Graph (Level 0)
     est_fine = model.layers[0].graph.get_soft_graph().detach().cpu().numpy()
     
-    # 2. 提取 Swin Window 划分 (Level 0 -> 1 Pooler)
+    # 2. 提取 Swin Window 划分
+    patch_ids = np.zeros(est_fine.shape[0])
     if hasattr(model, 'structure_S_0'):
-        S_matrix = model.structure_S_0.detach().cpu().numpy() # (N, K)
-        patch_ids = S_matrix.argmax(axis=1)
-    else:
-        patch_ids = np.zeros(est_fine.shape[0])
-
+        S_matrix = model.structure_S_0.detach().cpu().numpy() 
+        if S_matrix.sum() > 0:
+            patch_ids = S_matrix.argmax(axis=1)
+    
     # 硬阈值化
     thresh = metrics.get('Best_Threshold', 0.1) if metrics else 0.1
     est_fine_hard = (est_fine > thresh).astype(float)
     
-    gt_fine = meta.get('gt_fine', np.zeros_like(est_fine))
+    # GT 检查
+    gt_fine = meta.get('gt_fine')
+    if gt_fine is None:
+        gt_fine = np.zeros_like(est_fine) 
+    
     coords = meta['coords']
     
     # 绘图
@@ -86,10 +117,19 @@ def evaluate_static_graphs(model, meta, output_dir, metrics=None):
 
 def run_full_evaluation(model, args, accelerator, meta):
     accelerator.print("\n📊 Starting Full Evaluation...")
+    
+    # Warmup forward pass
     model.eval()
+    if accelerator.is_main_process:
+        accelerator.print("⚙️  Running warmup forward pass to initialize Geometric Poolers...")
+        with torch.no_grad():
+            dummy_x = torch.zeros(1, args.N, args.window_size).to(accelerator.device)
+            model(dummy_x)
     
     # 1. 静态图评估
     if accelerator.is_main_process:
+        os.makedirs(args.output_dir, exist_ok=True) 
+        
         est_fine = model.layers[0].graph.get_soft_graph().detach().cpu().numpy()
         gt_fine = meta.get('gt_fine')
         
@@ -97,12 +137,17 @@ def run_full_evaluation(model, args, accelerator, meta):
         if gt_fine is not None:
             metrics = count_accuracy(gt_fine, est_fine)
             accelerator.print("Static Metrics:", json.dumps(metrics, indent=4))
-            wandb.log(metrics)
+            
+            if wandb.run is not None: 
+                wandb.log(metrics)
+            
             with open(os.path.join(args.output_dir, "metrics.json"), 'w') as f:
                 json.dump(metrics, f, indent=4)
 
         plot_path = evaluate_static_graphs(model, meta, args.output_dir, metrics)
-        wandb.log({"static_result": wandb.Image(plot_path)})
+        
+        if wandb.run is not None:
+            wandb.log({"static_result": wandb.Image(plot_path)})
 
     accelerator.wait_for_everyone()
 
@@ -122,16 +167,36 @@ def run_full_evaluation(model, args, accelerator, meta):
             full_loader = torch.utils.data.DataLoader(full_ds, batch_size=1, shuffle=False)
             
             all_strengths = []
-            max_frames = 100 
+            max_frames = 200  # 可以根据需要调大，比如 200 帧能生成更流畅的 GIF
             frames_generated = 0
             
-            for batch in tqdm(full_loader, desc="Dynamic Inference"):
+            # OOM防范：Chunk Size
+            current_chunk_size = 16 
+
+            # --- TQDM 修改开始 ---
+            # 不再基于 loader 的长度，而是基于 max_frames 这一目标
+            pbar = tqdm(total=max_frames, desc="Generating Frames", unit="frames")
+            
+            for batch in full_loader:
                 batch = batch.to(accelerator.device)
-                curr_adj = compute_dynamic_strengths(model, batch, accelerator.device)
-                all_strengths.append(curr_adj.detach().cpu().numpy())
                 
-                frames_generated += curr_adj.shape[2]
-                if frames_generated >= max_frames: break
+                # 计算当前 batch 的因果图
+                curr_adj = compute_dynamic_strengths(model, batch, accelerator.device, chunk_size=current_chunk_size)
+                
+                all_strengths.append(curr_adj.numpy()) 
+                
+                # 获取当前生成的帧数
+                n_new_frames = curr_adj.shape[2]
+                
+                # 手动更新进度条
+                pbar.update(n_new_frames)
+                frames_generated += n_new_frames
+                
+                if frames_generated >= max_frames: 
+                    break
+            
+            pbar.close()
+            # --- TQDM 修改结束 ---
             
             final_dynamic_adj = np.concatenate(all_strengths, axis=2)[:, :, :max_frames]
             
@@ -141,10 +206,85 @@ def run_full_evaluation(model, args, accelerator, meta):
             gif_path = os.path.join(args.output_dir, "causal_evolution.gif")
             vis_adj = final_dynamic_adj / (final_dynamic_adj.max() + 1e-9)
             create_dynamic_gif(vis_adj, gif_path, fps=8)
-            wandb.log({"dynamic_evolution": wandb.Video(gif_path, fps=8, format="gif")})
+            
+            if wandb.run is not None:
+                wandb.log({"dynamic_evolution": wandb.Video(gif_path, fps=8, format="gif")})
             accelerator.print(f"✅ GIF saved to {gif_path}")
             
         except Exception as e:
             accelerator.print(f"❌ Dynamic inference failed: {e}")
+            import traceback
+            traceback.print_exc()
 
     accelerator.wait_for_everyone()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Standalone Inference for ST-CausalFormer")
+    
+    parser.add_argument("--model_path", type=str, required=True, help="Path to the trained model.pth")
+    parser.add_argument("--dataset", type=str, default="lorenz96")
+    parser.add_argument("--data_path", type=str, default="data/synthetic")
+    parser.add_argument("--replica_id", type=int, default=0)
+    parser.add_argument("--N", type=int, default=128)
+    parser.add_argument("--norm_coords", action="store_true")
+    parser.add_argument("--window_size", type=int, default=10)
+    parser.add_argument("--hierarchy", type=int, nargs='+', default=[32, 8])
+    parser.add_argument("--latent_C", type=int, default=8)
+    parser.add_argument("--d_model", type=int, default=64)
+    parser.add_argument("--num_bases", type=int, default=4)
+    parser.add_argument("--output_dir", type=str, default="./results")
+    parser.add_argument("--seed", type=int, default=42)
+
+    args = parser.parse_args()
+
+    # 路径构造: results/Dataset/Time/inference
+    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    args.output_dir = os.path.join(args.output_dir, args.dataset, timestamp, "inference")
+
+    accelerator = Accelerator()
+    accelerator.print(f"🚀 Starting Standalone Inference")
+    accelerator.print(f"📂 Output Dir: {args.output_dir}")
+    accelerator.print(f"📂 Loading model from: {args.model_path}")
+    
+    _, _, meta = get_data_context(args)
+    
+    model = ST_CausalFormer(
+        N=args.N, 
+        coords=meta['coords'], 
+        hierarchy=args.hierarchy, 
+        latent_C=args.latent_C, 
+        d_model=args.d_model,
+        num_bases=args.num_bases
+    )
+    
+    # 加载权重
+    try:
+        state_dict = torch.load(args.model_path, map_location='cpu')
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        
+        accelerator.print("✅ Weights loaded (with strict=False).")
+        if len(unexpected) > 0:
+            accelerator.print(f"⚠️  Ignored keys: {unexpected}")
+            
+    except Exception as e:
+        accelerator.print(f"❌ Failed to load weights: {e}")
+        exit(1)
+        
+    model.to(accelerator.device)
+    
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    run_full_evaluation(model, args, accelerator, meta)
+    
+    accelerator.print(f"✨ Inference finished. Results in {args.output_dir}")
+
+"""
+python src/evaluate.py \
+    --dataset SD \
+    --data_path data/real \
+    --model_path ./results/SD/20251128_234020/model.pth\
+    --N 716 \
+    --hierarchy 64 8 \
+    --window_size 12
+"""

@@ -152,7 +152,7 @@ class GeometricPooler(nn.Module):
         if self.initialized: return
         
         # 坐标标准化
-        coords_np = coords.detach().cpu().numpy()
+        coords_np = coords.detach().float().cpu().numpy()
         c_mean = coords_np.mean(axis=0)
         c_std = coords_np.std(axis=0) + 1e-5
         coords_norm = (coords_np - c_mean) / c_std
